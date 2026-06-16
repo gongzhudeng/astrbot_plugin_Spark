@@ -1804,15 +1804,12 @@ class Spark(Star):
             judge_template = self._get_cfg("proactive_settings", "proactive_judge_prompt") or ""
             if not judge_template:
                 judge_template = (
-                    '你是一个主动对话判断助手。根据以下信息判断现在是否适合主动给用户发消息。\n\n'
-                    '## 最近对话\n{last_user}\n{last_ai}\n\n'
-                    '## 距上次聊天\n{time_since_last_chat}\n\n'
-                    '## 当前时间\n{now}\n\n'
-                    '## 判断规则\n'
-                    '- 如果最近对话气氛不好、用户明显不想聊、话题已经结束 → 回复"否"\n'
-                    '- 如果用户可能期待回复、气氛轻松、适合续聊 → 回复"是"\n'
-                    '- 只回复一个字："是"或"否"，不要解释'
+                    '日程：{today_schedule}\n当前活动：{current_activity}\n'
+                    '用户节律：{time_period_prompt}\n距上次聊天：{time_since_last_chat}'
                 )
+            judge_rules = self._get_cfg("proactive_settings", "proactive_judge_rules") or ""
+            if not judge_rules:
+                judge_rules = '！！必须遵守！！：你只能输出一个字："是"或"否"，不允许输出任何其他字。'
             today_schedule = getattr(self.context, "_busy_schedule_today_schedule", "")
             outfit = getattr(self.context, "_busy_schedule_outfit", "")
             current_activity = getattr(self.context, "_busy_schedule_current_activity", "")
@@ -1852,7 +1849,7 @@ class Spark(Star):
             for attempt in range(_JUDGE_RETRIES):
                 try:
                     llm_resp = await provider.text_chat(
-                        prompt=None, contexts=[{"role": "user", "content": judge_prompt}] + judge_contexts, system_prompt=judge_persona,
+                        prompt=None, contexts=judge_contexts + [{"role": "user", "content": judge_prompt}] + [{"role": "user", "content": judge_rules}], system_prompt=judge_persona,
                     )
                     response = (llm_resp.completion_text if hasattr(llm_resp, "completion_text") else "").strip()
                     if not response:

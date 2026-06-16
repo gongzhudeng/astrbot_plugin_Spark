@@ -153,10 +153,16 @@
         "default": 3
       },
       "proactive_judge_prompt": {
-        "description": "判断提示词模板",
-        "hint": "支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt} {time_period_prompt}（需安装对应插件）。留空使用下方默认模板",
+        "description": "判断参考信息",
+        "hint": "作为判断的参考上下文，支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt} {time_period_prompt}",
         "type": "text",
-        "default": "日程：{today_schedule}\n穿搭：{outfit}\n{custom_prompt}\n\n你是一个主动对话判断助手，需要判断现在是否适合主动给用户发消息。\n\n## 最近对话摘要\n用户说: {last_user}\n你说: {last_ai}\n\n## 距上次聊天\n{time_since_last_chat}\n\n## 当前时间\n{now}\n\n## 判断规则\n- 判断当前气氛是否适合继续聊天，会不会打扰到用户\n- 如果最近对话气氛不好、用户明显不想聊、话题已经结束 → 回复\"否\"\n- 如果用户可能期待回复、气氛轻松、适合续聊 → 回复\"是\"\n- 你的回复风格应该符合你的人格设定\n- 只回复一个字：\"是\"或\"否\"，不要解释\n\n当前活动：{current_activity}\n下一个活动：{next_activity}\n节律：{time_period_prompt}"
+        "default": "日程：{today_schedule}\n当前活动：{current_activity}\n用户节律：{time_period_prompt}\n距上次聊天：{time_since_last_chat}"
+      },
+      "proactive_judge_rules": {
+        "description": "判断规则（放在最后，优先级最高）",
+        "hint": "作为最后一条消息发送给判断模型，确保 LLM 优先遵守。建议包含输出格式要求",
+        "type": "text",
+        "default": "！！必须遵守！！：你只能根据最上面的规则，经过判断后输出一个字：\"是\"或\"否\"\n\n除了这两个字之外，不允许输出任何字。"
       },
       "fixed_provider": {
         "description": "生成模型供应商",
