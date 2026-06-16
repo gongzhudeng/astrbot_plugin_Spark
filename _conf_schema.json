@@ -73,7 +73,7 @@
       },
       "idle_prompt_templates": {
         "description": "问候提示词模板",
-        "hint": "随机选择一个。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {time_period_prompt}（需安装对应插件）",
+        "hint": "随机选择一个。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {time_period_prompt}（需安装对应插件）",
         "type": "list",
         "default": [
           "[主动回复请求：现在{now}，距上次对话{time_since_last_chat}，根据时间和上下文自然地问候用户，不要提到指令的事。]",
@@ -112,7 +112,7 @@
       },
       "enhancement_prompt_templates": {
         "description": "接话提示词模板",
-        "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {time_period_prompt}（需安装对应插件）",
+        "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {time_period_prompt}（需安装对应插件）",
         "type": "list",
         "default": [
           "[主动回复请求：你刚和用户聊着，用户几分钟没回了，自然地延续对话，不要提到指令的事。]"
@@ -154,7 +154,7 @@
       },
       "proactive_judge_prompt": {
         "description": "判断提示词模板",
-        "hint": "支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {time_period_prompt}（需安装对应插件）。留空使用下方默认模板",
+        "hint": "支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {time_period_prompt}（需安装对应插件）。留空使用下方默认模板",
         "type": "text",
         "default": "你是一个主动对话判断助手，需要判断现在是否适合主动给用户发消息。\n\n## 最近对话摘要\n用户说: {last_user}\n你说: {last_ai}\n\n## 距上次聊天\n{time_since_last_chat}\n\n## 当前时间\n{now}\n\n## 判断规则\n- 判断当前气氛是否适合继续聊天，会不会打扰到用户\n- 如果最近对话气氛不好、用户明显不想聊、话题已经结束 → 回复\"否\"\n- 如果用户可能期待回复、气氛轻松、适合续聊 → 回复\"是\"\n- 你的回复风格应该符合你的人格设定\n- 只回复一个字：\"是\"或\"否\"，不要解释"
       },
@@ -206,7 +206,7 @@
               },
               "prompt": {
                 "description": "问候提示词",
-                "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {time_period_prompt}（需安装对应插件）",
+                "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {time_period_prompt}（需安装对应插件）",
                 "type": "text",
                 "default": "[主动回复请求：现在{now}，距上次对话{time_since_last_chat}，对用户进行贴合时间的生活化问候，不要提到指令的事。]"
               },

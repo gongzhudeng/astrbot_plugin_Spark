@@ -280,7 +280,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.1.5", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.1.6", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -1814,12 +1814,17 @@ class Spark(Star):
                     '- 只回复一个字："是"或"否"，不要解释'
                 )
             today_schedule = getattr(self.context, "_busy_schedule_today_schedule", "")
+            outfit = getattr(self.context, "_busy_schedule_outfit", "")
+            current_activity = getattr(self.context, "_busy_schedule_current_activity", "")
+            next_activity = getattr(self.context, "_busy_schedule_next_activity", "")
             time_period_prompt = getattr(self.context, "_time_period_current_prompt", "")
             try:
                 judge_prompt = judge_template.format(
                     now=now_str, last_user=last_user, last_ai=last_ai,
                     time_since_last_chat=time_since_last_chat, umo=umo,
-                    today_schedule=today_schedule, time_period_prompt=time_period_prompt,
+                    today_schedule=today_schedule, outfit=outfit,
+                    current_activity=current_activity, next_activity=next_activity,
+                    time_period_prompt=time_period_prompt,
                 )
             except KeyError as e:
                 logger.warning(f"[Spark] Judge prompt format error: {e}")
@@ -1922,6 +1927,9 @@ class Spark(Star):
 
             if prompt_template:
                 today_schedule = getattr(self.context, "_busy_schedule_today_schedule", "")
+                outfit = getattr(self.context, "_busy_schedule_outfit", "")
+                current_activity = getattr(self.context, "_busy_schedule_current_activity", "")
+                next_activity = getattr(self.context, "_busy_schedule_next_activity", "")
                 time_period_prompt = getattr(self.context, "_time_period_current_prompt", "")
                 try:
                     prompt = prompt_template.format(
@@ -1931,6 +1939,9 @@ class Spark(Star):
                         umo=umo,
                         time_since_last_chat=time_since_last_chat,
                         today_schedule=today_schedule,
+                        outfit=outfit,
+                        current_activity=current_activity,
+                        next_activity=next_activity,
                         time_period_prompt=time_period_prompt,
                     )
                 except KeyError as e:
