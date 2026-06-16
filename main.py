@@ -280,7 +280,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.0", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.1", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -1846,20 +1846,44 @@ class Spark(Star):
             if not judge_persona:
                 judge_persona = "你是一个对话判断助手，只回复是或否"
 
-            llm_resp = await provider.text_chat(
-                prompt=None, contexts=[{"role": "user", "content": judge_prompt}] + judge_contexts, system_prompt=judge_persona,
-            )
-            response = (llm_resp.completion_text if hasattr(llm_resp, "completion_text") else "").strip()
+            _JUDGE_RETRIES = 3
+            _RETRYABLE = (502, 503, 504)
+            last_err = None
+            for attempt in range(_JUDGE_RETRIES):
+                try:
+                    llm_resp = await provider.text_chat(
+                        prompt=None, contexts=[{"role": "user", "content": judge_prompt}] + judge_contexts, system_prompt=judge_persona,
+                    )
+                    response = (llm_resp.completion_text if hasattr(llm_resp, "completion_text") else "").strip()
+                    if not response:
+                        raise ValueError("Empty completion text")
 
-            should_reply = "是" in response[:10]
-            if should_reply:
-                logger.info(f"[Spark] Judge YES for {umo}: '{response[:20]}'")
-            else:
-                logger.info(f"[Spark] Judge NO for {umo}: '{response[:20]}'")
-            return should_reply
+                    should_reply = "是" in response[:10]
+                    if should_reply:
+                        logger.info(f"[Spark] Judge YES for {umo}: '{response[:20]}'")
+                    else:
+                        logger.info(f"[Spark] Judge NO for {umo}: '{response[:20]}'")
+                    return should_reply
 
-        except Exception as e:
-            logger.error(f"[Spark] Judge error({umo}): {e}")
+                except Exception as e:
+                    last_err = e
+                    is_retryable = False
+                    err_str = str(e)
+                    if any(code in err_str for code in ("502", "503", "504")):
+                        is_retryable = True
+                    if "no usable output" in err_str.lower() or "empty" in err_str.lower():
+                        is_retryable = True
+                    if "timeout" in err_str.lower() or "connect" in err_str.lower():
+                        is_retryable = True
+
+                    if is_retryable and attempt < _JUDGE_RETRIES - 1:
+                        wait = 2 ** (attempt + 1)
+                        logger.warning(f"[Spark] Judge retry {attempt + 1}/{_JUDGE_RETRIES} for {umo}: {e}, waiting {wait}s")
+                        await asyncio.sleep(wait)
+                    else:
+                        break
+
+            logger.error(f"[Spark] Judge failed after {_JUDGE_RETRIES} attempts for {umo}: {last_err}, defaulting to allow")
             return True
 
     def _resolve_persona(self, *config_keys) -> str:

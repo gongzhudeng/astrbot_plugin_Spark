@@ -1,5 +1,12 @@
 # 灵犀 · 主动对话 更新日志
 
+## v1.2.1
+
+### 修复
+
+- 智能判断 LLM 调用失败时自动重试最多 3 次（指数退避），仅对临时性错误重试（502/503/504/超时/空响应）
+- 判断失败后不再静默跳过，日志会记录重试过程和最终失败原因
+
 ## v1.0.0
 
 基于 [astrbot_plugin_Conversa v3.0.0](https://github.com/Luna-channel/astrbot_plugin_Conversa) 二次开发，灵感参考：Luna-channel。
