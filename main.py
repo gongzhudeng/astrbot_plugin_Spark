@@ -1886,6 +1886,10 @@ class Spark(Star):
             logger.error(f"[Spark] Judge failed after {_JUDGE_RETRIES} attempts for {umo}: {last_err}, defaulting to allow")
             return True
 
+        except Exception as e:
+            logger.error(f"[Spark] Judge unexpected error({umo}): {e}, defaulting to allow")
+            return True
+
     def _resolve_persona(self, *config_keys) -> str:
         """Resolve persona_id from config to system_prompt via persona_mgr."""
         persona_id = self._get_cfg(*config_keys) or ""
