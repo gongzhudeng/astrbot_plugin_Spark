@@ -2,7 +2,7 @@
 
 > 作者：灵犀 | 仓库：[astrbot_plugin_Spark](https://github.com/gongzhudeng/astrbot_plugin_Spark) | 主页：[gongzhudeng](https://github.com/gongzhudeng)
 
-> **版本**：v1.0.0
+> **版本**：v1.1.7
 > **插件名**：`astrbot_plugin_Spark`
 
 灵犀让 AI 像真人一样主动找你聊天——在对话沉寂一段时间后自然地重新开口，或者在你们正聊着的时候概率性地追加一句话，营造更真实的对话体验。
@@ -170,13 +170,21 @@ AstrBot/data/plugins/astrbot_plugin_Spark/
 
 所有提示词模板支持以下占位符：
 
-| 占位符 | 含义 |
-|---|---|
-| `{now}` | 当前时间 |
-| `{time_since_last_chat}` | 距离上次聊天过了多久 |
-| `{last_user}` | 用户最后一条消息 |
-| `{last_ai}` | AI 最后一条回复 |
-| `{umo}` | 会话 ID |
+| 占位符 | 含义 | 来源 |
+|---|---|---|
+| `{now}` | 当前时间 | Spark 内置 |
+| `{time_since_last_chat}` | 距离上次聊天过了多久 | Spark 内置 |
+| `{last_user}` | 用户最后一条消息 | Spark 内置 |
+| `{last_ai}` | AI 最后一条回复 | Spark 内置 |
+| `{umo}` | 会话 ID | Spark 内置 |
+| `{today_schedule}` | 今日日程文本 | busy_schedule 插件 |
+| `{outfit}` | 今日穿搭描述 | busy_schedule 插件 |
+| `{current_activity}` | 当前正在做什么（每30秒刷新） | busy_schedule 插件 |
+| `{next_activity}` | 下一个活动及开始时间（每30秒刷新） | busy_schedule 插件 |
+| `{custom_prompt}` | 忙碌日程插件中的自定义注入提示词（每30秒刷新） | busy_schedule 插件 |
+| `{time_period_prompt}` | 当前节律提示词 | time_period_prompt 插件 |
+
+> 未安装对应插件时，占位符会被替换为空字符串，不会报错。
 
 ---
 
