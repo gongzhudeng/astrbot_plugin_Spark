@@ -73,7 +73,7 @@
       },
       "idle_prompt_templates": {
         "description": "问候提示词模板",
-        "hint": "随机选择一个。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo}",
+        "hint": "随机选择一个。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule}（需安装忙碌日程插件）",
         "type": "list",
         "default": [
           "[主动回复请求：现在{now}，距上次对话{time_since_last_chat}，根据时间和上下文自然地问候用户，不要提到指令的事。]",
@@ -112,7 +112,7 @@
       },
       "enhancement_prompt_templates": {
         "description": "接话提示词模板",
-        "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
+        "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule}（需安装忙碌日程插件）",
         "type": "list",
         "default": [
           "[主动回复请求：你刚和用户聊着，用户几分钟没回了，自然地延续对话，不要提到指令的事。]"
@@ -206,7 +206,7 @@
               },
               "prompt": {
                 "description": "问候提示词",
-                "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
+                "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule}（需安装忙碌日程插件）",
                 "type": "text",
                 "default": "[主动回复请求：现在{now}，距上次对话{time_since_last_chat}，对用户进行贴合时间的生活化问候，不要提到指令的事。]"
               },

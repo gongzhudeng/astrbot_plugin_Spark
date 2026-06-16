@@ -280,7 +280,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.1.2", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.1.3", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -1920,13 +1920,15 @@ class Spark(Star):
             last_user, last_ai = await self._get_last_messages(umo)
 
             if prompt_template:
+                today_schedule = getattr(self.context, "_busy_schedule_today_schedule", "")
                 try:
                     prompt = prompt_template.format(
                         now=now_str,
                         last_user=last_user,
                         last_ai=last_ai,
                         umo=umo,
-                        time_since_last_chat=time_since_last_chat
+                        time_since_last_chat=time_since_last_chat,
+                        today_schedule=today_schedule,
                     )
                 except KeyError as e:
                     logger.warning(f"[Spark] prompt format error: {e}")
