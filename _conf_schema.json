@@ -212,7 +212,7 @@
               },
               "ignore_dnd": {
                 "description": "忽略免打扰",
-                "hint": "开启后该时段不受免打扰和忙碌时段影响，始终发送",
+                "hint": "开启后该时段不受免打扰和忙碌时段影响，触发时会先唤醒忙碌状态并清空队列，等待指定秒数后再发送问候",
                 "type": "bool",
                 "default": false
               }
@@ -220,6 +220,12 @@
           }
         },
         "default": []
+      },
+      "ignore_busy_flush_delay_seconds": {
+        "description": "唤醒忙碌后延迟（秒）",
+        "hint": "ignore_dnd 时段触发时，唤醒忙碌并清空队列后等待此秒数再发送问候，让 AI 先处理完堆积消息",
+        "type": "int",
+        "default": 10
       }
     }
   },

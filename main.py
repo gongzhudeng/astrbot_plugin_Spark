@@ -793,6 +793,7 @@ class Spark(Star):
                     delay_m = max(1, base_delay_m + random.randint(-fluctuation_m, fluctuation_m))
                 
                 st.next_idle_ts = now_ts + delay_m * 60
+                logger.debug(f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m}m, next={st.next_idle_ts:.0f}")
         except Exception as e:
             logger.warning(f"[Spark] 计算 next_idle_ts 失败: {e}")
 
@@ -822,6 +823,7 @@ class Spark(Star):
                         fluctuation_m = min(fluctuation_m, max(0, base_delay_m - 1))
                         delay_m = max(1, base_delay_m + random.randint(-fluctuation_m, fluctuation_m))
                     st.next_idle_ts = now_ts + delay_m * 60
+                    logger.debug(f"[Spark] 沉寂计时刷新(AI回复): {umo}, delay={delay_m}m, next={st.next_idle_ts:.0f}")
             # Cancel any pending (sleeping) enhancement task so each LLM turn re-evaluates.
             old_task = self._enhancement_tasks.get(umo)
             if old_task and not old_task.done():
@@ -1204,55 +1206,21 @@ class Spark(Star):
     # 立即主动：跳过判断，立即触发一次主动回复
     @filter.command("立即主动")
     async def _cmd_instant_proactive(self, event: AstrMessageEvent):
-        """立即触发一次主动问候，跳过 LLM 判断步骤，直接生成并发送消息。"""
+        """立即触发一次沉寂问候，跳过 LLM 判断步骤。"""
         umo = event.unified_msg_origin
         profile = self._user_profiles.get(umo)
         if not profile or not profile.subscribed:
             yield event.plain_result("当前会话未订阅主动对话，请先发送 /灵犀 订阅")
             return
 
-        tz = self._get_cfg("basic_settings", "timezone") or None
-
         idle_prompts = self._get_cfg("idle_greetings", "idle_prompt_templates") or []
         if not idle_prompts:
-            idle_prompts = ["请自然地与用户打个招呼，延续你们的对话。"]
+            yield event.plain_result("未配置沉寂问候模板，请先在设置中配置 idle_prompt_templates")
+            return
 
-        prompt_template = random.choice(idle_prompts)
         yield event.plain_result("正在发送主动消息...")
-
-        # 直接调用生成步骤，跳过判断
-        gen_provider = self._get_gen_provider(umo)
-        gen_persona = await self._get_gen_persona(umo)
-
-        now = _now_tz(tz)
-        time_fmt = self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M"
-        now_str = now.strftime(time_fmt)
-        st = self._states.get(umo)
-        time_since_last_chat = "未知"
-        if st and st.last_user_reply_ts > 0:
-            time_delta = now.timestamp() - st.last_user_reply_ts
-            time_since_last_chat = _format_time_delta(time_delta)
-        last_user, last_ai = await self._get_last_messages(umo)
-
-        try:
-            prompt = prompt_template.format(
-                now=now_str, last_user=last_user, last_ai=last_ai,
-                umo=umo, time_since_last_chat=time_since_last_chat,
-            )
-        except KeyError:
-            prompt = prompt_template
-
-        if HAS_AGENT_PIPELINE:
-            response_text = await self._run_agent_pipeline(
-                umo, prompt, tz, provider=gen_provider, persona=gen_persona
-            )
-        else:
-            response_text = await self._run_legacy_llm(
-                umo, prompt, provider=gen_provider, persona=gen_persona
-            )
-
-        if response_text and not getattr(self, '_last_cron_event_sent', False):
-            await self._send_text(umo, response_text)
+        tz = self._get_cfg("basic_settings", "timezone") or None
+        await self._proactive_reply(umo, tz, random.choice(idle_prompts), skip_judge=True)
 
     # 主动状态：显示当前订阅和运行状态
     @filter.command("主动状态")
@@ -1702,6 +1670,16 @@ class Spark(Star):
                 prompt_template = slot_cfg.get("prompt", "")
                 if prompt_template:
                     logger.info(f"[Spark] 触发每日定时{slot_num}回复 {umo} (ignore_dnd={slot_cfg.get('ignore_dnd', False)})")
+                    # When ignore_dnd overrides busy state: wake AI, flush queued messages first
+                    if slot_cfg.get("ignore_dnd", False) and is_busy:
+                        wake_fn = getattr(self.context, "_busy_schedule_wake_and_flush", None)
+                        if wake_fn:
+                            try:
+                                await wake_fn(umo)
+                                flush_delay = int(self._get_cfg("daily_prompts", "ignore_busy_flush_delay_seconds") or 10)
+                                await asyncio.sleep(flush_delay)
+                            except Exception as e:
+                                logger.warning(f"[Spark] wake_and_flush 失败: {e}")
                     ok = await self._proactive_reply(umo, tz, prompt_template, skip_judge=True)
                     if ok:
                         st.mark_fired(tag)
