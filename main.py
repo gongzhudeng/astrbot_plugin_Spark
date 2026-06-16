@@ -280,7 +280,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.1.3", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.1.4", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -1840,7 +1840,7 @@ class Spark(Star):
                 judge_persona = "你是一个对话判断助手，只回复是或否"
 
             llm_resp = await provider.text_chat(
-                prompt=judge_prompt, contexts=judge_contexts, system_prompt=judge_persona,
+                prompt=None, contexts=[{"role": "user", "content": judge_prompt}] + judge_contexts, system_prompt=judge_persona,
             )
             response = (llm_resp.completion_text if hasattr(llm_resp, "completion_text") else "").strip()
 
@@ -2077,8 +2077,8 @@ class Spark(Star):
         contexts = await self._get_conversation_contexts(umo, gen_history_rounds)
 
         llm_resp = await provider.text_chat(
-            prompt=prompt,
-            contexts=contexts,
+            prompt=None,
+            contexts=[{"role": "user", "content": prompt}] + contexts,
             system_prompt=persona,
         )
         text = llm_resp.completion_text if hasattr(llm_resp, "completion_text") else ""
