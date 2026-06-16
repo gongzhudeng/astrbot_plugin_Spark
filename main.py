@@ -1859,7 +1859,7 @@ class Spark(Star):
         if not persona_id:
             return ""
         try:
-            persona_mgr = self.context.get_config_manager().persona_mgr
+            persona_mgr = self.context.persona_manager
             if persona_mgr:
                 for p in persona_mgr.personas:
                     if p.persona_id == persona_id:
@@ -2248,7 +2248,7 @@ class Spark(Star):
             conversation = await conv_mgr.get_conversation(umo, curr_cid)
             if not conversation or not conversation.persona_id:
                 return ""
-            persona_mgr = self.context.get_config_manager().persona_mgr
+            persona_mgr = self.context.persona_manager
             if persona_mgr:
                 for p in persona_mgr.personas:
                     if p.persona_id == conversation.persona_id and p.system_prompt:
