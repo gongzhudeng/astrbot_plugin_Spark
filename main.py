@@ -280,7 +280,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.1", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.3", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -1672,14 +1672,14 @@ class Spark(Star):
                     logger.info(f"[Spark] 触发每日定时{slot_num}回复 {umo} (ignore_dnd={slot_cfg.get('ignore_dnd', False)})")
                     # When ignore_dnd overrides busy state: wake AI, flush queued messages first
                     if slot_cfg.get("ignore_dnd", False) and is_busy:
+                        flush_delay = int(self._get_cfg("daily_prompts", "ignore_busy_flush_delay_seconds") or 10)
                         wake_fn = getattr(self.context, "_busy_schedule_wake_and_flush", None)
                         if wake_fn:
                             try:
                                 await wake_fn(umo)
-                                flush_delay = int(self._get_cfg("daily_prompts", "ignore_busy_flush_delay_seconds") or 10)
-                                await asyncio.sleep(flush_delay)
                             except Exception as e:
                                 logger.warning(f"[Spark] wake_and_flush 失败: {e}")
+                        await asyncio.sleep(flush_delay)
                     ok = await self._proactive_reply(umo, tz, prompt_template, skip_judge=True)
                     if ok:
                         st.mark_fired(tag)
@@ -1792,9 +1792,10 @@ class Spark(Star):
 
             st = self._states.get(umo)
             time_since_last_chat = "未知"
-            if st and st.last_user_reply_ts > 0:
-                time_delta = now.timestamp() - st.last_user_reply_ts
-                time_since_last_chat = _format_time_delta(time_delta)
+            if st:
+                _last_chat_ts = max(st.last_user_reply_ts, st.last_proactive_reply_ts, st.last_ai_reply_ts)
+                if _last_chat_ts > 0:
+                    time_since_last_chat = _format_time_delta(now.timestamp() - _last_chat_ts)
 
             last_user, last_ai = await self._get_last_messages(umo)
 
@@ -1945,9 +1946,10 @@ class Spark(Star):
 
             st = self._states.get(umo)
             time_since_last_chat = "未知"
-            if st and st.last_user_reply_ts > 0:
-                time_delta = now.timestamp() - st.last_user_reply_ts
-                time_since_last_chat = _format_time_delta(time_delta)
+            if st:
+                _last_chat_ts = max(st.last_user_reply_ts, st.last_proactive_reply_ts, st.last_ai_reply_ts)
+                if _last_chat_ts > 0:
+                    time_since_last_chat = _format_time_delta(now.timestamp() - _last_chat_ts)
 
             last_user, last_ai = await self._get_last_messages(umo)
 
@@ -2001,16 +2003,17 @@ class Spark(Star):
                 await self._send_text(umo, response_text)
             logger.info(f"[Spark] 已发送主动回复给 {umo}: {response_text[:50]}...")
 
-            # Save proactive message to conversation history so AI remembers
-            try:
-                conv_mgr = self.context.conversation_manager
-                curr_cid = await conv_mgr.get_curr_conversation_id(umo)
-                if curr_cid:
-                    await self._add_message_pair_to_history(
-                        umo, curr_cid, None, prompt, response_text
-                    )
-            except Exception as e:
-                logger.warning(f"[Spark] 保存主动回复历史失败: {e}")
+            # Save history only for legacy path; agent pipeline already calls persist_agent_history
+            if not HAS_AGENT_PIPELINE:
+                try:
+                    conv_mgr = self.context.conversation_manager
+                    curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+                    if curr_cid:
+                        await self._add_message_pair_to_history(
+                            umo, curr_cid, None, prompt, response_text
+                        )
+                except Exception as e:
+                    logger.warning(f"[Spark] 保存主动回复历史失败: {e}")
 
             # Update state
             now_ts = now.timestamp()
@@ -2140,9 +2143,10 @@ class Spark(Star):
 
             st = self._states.get(umo)
             time_since_last_chat = "未知"
-            if st and st.last_user_reply_ts > 0:
-                time_delta = now.timestamp() - st.last_user_reply_ts
-                time_since_last_chat = _format_time_delta(time_delta)
+            if st:
+                _last_chat_ts = max(st.last_user_reply_ts, st.last_proactive_reply_ts, st.last_ai_reply_ts)
+                if _last_chat_ts > 0:
+                    time_since_last_chat = _format_time_delta(now.timestamp() - _last_chat_ts)
 
             last_user, last_ai = await self._get_last_messages(umo)
 
