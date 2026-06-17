@@ -280,7 +280,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.3", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.4", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -1615,9 +1615,10 @@ class Spark(Star):
                     fluctuation_m = min(fluctuation_m, max(0, base_delay_m - 1))
                     delay_m = max(1, base_delay_m + random.randint(-fluctuation_m, fluctuation_m))
                 
-                # 基于最后活跃时间计算
+                # Base on last activity time, but never set a timestamp already in the past
                 base_ts = st.last_ts if st.last_ts > 0 else now.timestamp()
-                st.next_idle_ts = base_ts + delay_m * 60
+                computed = base_ts + delay_m * 60
+                st.next_idle_ts = computed if computed > now.timestamp() else now.timestamp() + delay_m * 60
                 logger.info(f"[Spark] 沉寂问候初始化计时: {umo}, delay={delay_m}m, 将在 {st.next_idle_ts:.0f} 触发")
                 await self._debounced_save_session_data()
                 return  # 本次不触发，等下次检查
