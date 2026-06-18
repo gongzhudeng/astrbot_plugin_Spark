@@ -280,7 +280,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.4", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.5", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -1817,7 +1817,8 @@ class Spark(Star):
             current_activity = getattr(self.context, "_busy_schedule_current_activity", "")
             next_activity = getattr(self.context, "_busy_schedule_next_activity", "")
             custom_prompt = getattr(self.context, "_busy_schedule_custom_prompt", "")
-            time_period_prompt = getattr(self.context, "_time_period_current_prompt", "")
+            _get_prompt = getattr(self.context, "_time_period_get_prompt", None)
+            time_period_prompt = _get_prompt() if callable(_get_prompt) else getattr(self.context, "_time_period_current_prompt", "")
             try:
                 judge_prompt = judge_template.format(
                     now=now_str, last_user=last_user, last_ai=last_ai,
@@ -1960,7 +1961,8 @@ class Spark(Star):
                 current_activity = getattr(self.context, "_busy_schedule_current_activity", "")
                 next_activity = getattr(self.context, "_busy_schedule_next_activity", "")
                 custom_prompt = getattr(self.context, "_busy_schedule_custom_prompt", "")
-                time_period_prompt = getattr(self.context, "_time_period_current_prompt", "")
+                _get_prompt = getattr(self.context, "_time_period_get_prompt", None)
+                time_period_prompt = _get_prompt() if callable(_get_prompt) else getattr(self.context, "_time_period_current_prompt", "")
                 try:
                     prompt = prompt_template.format(
                         now=now_str,
