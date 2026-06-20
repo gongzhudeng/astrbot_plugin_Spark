@@ -1,5 +1,16 @@
 # 灵犀 · 主动对话 更新日志
 
+## v1.3.0
+
+### 优化
+
+- **主动对话缓存命中率提升**：主动对话现在通过 `OnLLMRequestEvent` 钩子触发 busy_schedule 插件的注入，使主动对话的 system_prompt 与正常对话保持一致，共享 KV Cache，提高缓存命中率，降低 API 调用成本
+- **清理提示词模板**：移除提示词模板中的 busy_schedule 插件占位符（`{today_schedule}`, `{outfit}`, `{current_activity}`, `{next_activity}`, `{custom_prompt}`），改为由 busy_schedule 插件通过钩子自动注入
+
+### 新增
+
+- **灵犀AI忙碌时段管理插件集成说明**：在 README 中添加了对 astrbot_plugin_busy_schedule 插件的集成说明，安装即生效，无需配置
+
 ## v1.2.6
 
 ### 修复

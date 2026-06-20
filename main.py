@@ -55,6 +55,14 @@ try:
 except ImportError:
     HAS_AGENT_PIPELINE = False
 
+# 导入事件钩子（用于触发 OnLLMRequestEvent，使 busy_schedule 等插件能注入内容）
+try:
+    from astrbot.core.pipeline.context_utils import call_event_hook
+    from astrbot.core.star.star_handler import EventType
+    HAS_EVENT_HOOK = True
+except ImportError:
+    HAS_EVENT_HOOK = False
+
 # 工具函数
 def _ensure_dir(p: str) -> str:
     """确保目录存在，不存在则创建"""
@@ -280,7 +288,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.2.6", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.3.0", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -2072,6 +2080,14 @@ class Spark(Star):
             provider=provider,
             req=req,
         )
+
+        # 触发 OnLLMRequestEvent 钩子，使 busy_schedule 等插件能注入内容到 system_prompt
+        # 这样主动对话的 system_prompt 就能和正常对话保持一致，共享 KV Cache
+        if HAS_EVENT_HOOK:
+            try:
+                await call_event_hook(cron_event, EventType.OnLLMRequestEvent, req)
+            except Exception as e:
+                logger.warning(f"[Spark] 触发 OnLLMRequestEvent 钩子失败: {e}")
 
         if not result or not result.agent_runner:
             logger.warning(f"[Spark] build_main_agent 返回空结果: {umo}")
