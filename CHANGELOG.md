@@ -6,6 +6,7 @@
 
 - **主动对话缓存命中率提升**：主动对话现在通过 `OnLLMRequestEvent` 钩子触发 busy_schedule 插件的注入，使主动对话的 system_prompt 与正常对话保持一致，共享 KV Cache，提高缓存命中率，降低 API 调用成本
 - **清理提示词模板**：移除提示词模板中的 busy_schedule 插件占位符（`{today_schedule}`, `{outfit}`, `{current_activity}`, `{next_activity}`, `{custom_prompt}`），改为由 busy_schedule 插件通过钩子自动注入
+- **人设注入方式统一**：主动对话现在通过 `_ensure_persona_and_skills` 方法注入人设，与正常对话保持一致，进一步提升缓存命中率
 
 ### 新增
 

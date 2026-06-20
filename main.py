@@ -2062,12 +2062,20 @@ class Spark(Star):
         if not provider:
             provider = self._get_gen_provider(umo)
 
-        if not persona:
-            persona = await self._get_gen_persona(umo)
         req = ProviderRequest()
         req.prompt = prompt
-        if persona:
-            req.system_prompt = persona
+
+        # 获取会话并设置到 req.conversation，使 _ensure_persona_and_skills 能正常工作
+        # 这样主动对话的人设注入方式就和正常对话相同，能共享 KV Cache
+        try:
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+            if curr_cid:
+                conversation = await conv_mgr.get_conversation(umo, curr_cid)
+                if conversation:
+                    req.conversation = conversation
+        except Exception as e:
+            logger.warning(f"[Spark] 获取会话失败: {e}")
 
         # Load conversation history into req.contexts so the LLM can see prior chat
         gen_history_rounds = self._get_cfg("proactive_settings", "gen_history_rounds", 10)
