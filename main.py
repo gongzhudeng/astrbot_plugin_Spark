@@ -288,7 +288,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.3.0", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.3.1", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -2114,8 +2114,12 @@ class Spark(Star):
         if not response_text:
             return None
 
-        # 记录 Agent 是否已通过工具发送了消息
-        self._last_cron_event_sent = getattr(cron_event, '_has_send_oper', False)
+        # Only suppress Spark's manual text send if the agent/tool already sent the
+        # full response and returned no text (e.g. a tool that sends its own text reply).
+        # Do NOT suppress when a tool only sent an image while the agent still returned text.
+        self._last_cron_event_sent = (
+            getattr(cron_event, '_has_send_oper', False) and not response_text
+        )
 
         # 保存对话历史（与框架 cron 系统一致）
         try:
