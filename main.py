@@ -288,7 +288,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.3.1", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.3.2", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -1568,10 +1568,19 @@ class Spark(Star):
                 time_str = item.get("time", "")
                 prompt_str = item.get("prompt", "")
                 ignore_dnd = item.get("ignore_dnd", False)
+                jitter_minutes = max(0, int(item.get("jitter_minutes", 0) or 0))
                 time_tuple = _parse_hhmm(time_str)
                 if time_tuple:
-                    tag = f"daily_{idx}@{now.strftime('%Y-%m-%d')} {time_tuple[0]:02d}:{time_tuple[1]:02d}"
-                    slots_info.append((idx, time_tuple, tag, {
+                    if jitter_minutes > 0:
+                        # Stable per-day offset: same seed → same offset every minute of the day
+                        _rng = random.Random(now.toordinal() * 1000 + idx)
+                        offset = _rng.randint(-jitter_minutes, jitter_minutes)
+                        total = max(0, min(time_tuple[0] * 60 + time_tuple[1] + offset, 23 * 60 + 59))
+                        actual_time = (total // 60, total % 60)
+                    else:
+                        actual_time = time_tuple
+                    tag = f"daily_{idx}@{now.strftime('%Y-%m-%d')} {actual_time[0]:02d}:{actual_time[1]:02d}"
+                    slots_info.append((idx, actual_time, tag, {
                         "prompt": prompt_str, "ignore_dnd": ignore_dnd,
                     }))
             return slots_info
