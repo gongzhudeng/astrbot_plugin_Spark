@@ -2,7 +2,7 @@
 
 > 作者：灵犀 | 仓库：[astrbot_plugin_Spark](https://github.com/gongzhudeng/astrbot_plugin_Spark) | 主页：[gongzhudeng](https://github.com/gongzhudeng)
 
-> **版本**：v1.3.0
+> **版本**：v1.4.0
 > **插件名**：`astrbot_plugin_Spark`
 
 灵犀让 AI 像真人一样主动找你聊天——在对话沉寂一段时间后自然地重新开口，或者在你们正聊着的时候概率性地追加一句话，营造更真实的对话体验。
@@ -177,9 +177,8 @@ AstrBot/data/plugins/astrbot_plugin_Spark/
 | `{last_user}` | 用户最后一条消息 | Spark 内置 |
 | `{last_ai}` | AI 最后一条回复 | Spark 内置 |
 | `{umo}` | 会话 ID | Spark 内置 |
-| `{time_period_prompt}` | 当前节律提示词 | time_period_prompt 插件 |
 
-> 未安装对应插件时，占位符会被替换为空字符串，不会报错。
+> v1.4.0 起，节律插件（`astrbot_plugin_time_period_prompt`）、记忆召回（`astrbot_plugin_livingmemory`）、知识库等内容均通过 `OnLLMRequestEvent` 钩子自动注入，无需在提示词模板中手动添加占位符。如你之前配置了 `{time_period_prompt}`，请手动删除，否则会导致节律内容重复注入。
 
 ### 灵犀AI忙碌时段管理插件集成
 
