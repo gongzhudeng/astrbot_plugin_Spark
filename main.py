@@ -288,7 +288,7 @@ class Reminder:
 
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
-@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.3.2", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
+@register("astrbot_plugin_Spark", "灵犀 · 主动对话", "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候", "1.4.0", "https://github.com/gongzhudeng/astrbot_plugin_Spark")
 class Spark(Star):
 
     # 初始化
@@ -2086,9 +2086,8 @@ class Spark(Star):
         except Exception as e:
             logger.warning(f"[Spark] 获取会话失败: {e}")
 
-        # Load conversation history into req.contexts so the LLM can see prior chat
-        gen_history_rounds = self._get_cfg("proactive_settings", "gen_history_rounds", 10)
-        req.contexts = await self._get_conversation_contexts(umo, gen_history_rounds)
+        # History is loaded automatically from req.conversation by build_main_agent,
+        # matching the normal conversation pipeline exactly and maximising KV cache reuse.
 
         result = await build_main_agent(
             event=cron_event,
@@ -2098,19 +2097,21 @@ class Spark(Star):
             req=req,
         )
 
-        # 触发 OnLLMRequestEvent 钩子，使 busy_schedule 等插件能注入内容到 system_prompt
-        # 这样主动对话的 system_prompt 就能和正常对话保持一致，共享 KV Cache
+        if not result or not result.agent_runner:
+            logger.warning(f"[Spark] build_main_agent 返回空结果: {umo}")
+            return None
+
+        runner = result.agent_runner
+
+        # Fire on_llm_request hooks BEFORE the LLM call so that plugins like
+        # livingmemory, knowledge_base, and time_period_prompt can inject their
+        # content into req — identical to the normal conversation pipeline.
         if HAS_EVENT_HOOK:
             try:
                 await call_event_hook(cron_event, EventType.OnLLMRequestEvent, req)
             except Exception as e:
                 logger.warning(f"[Spark] 触发 OnLLMRequestEvent 钩子失败: {e}")
 
-        if not result or not result.agent_runner:
-            logger.warning(f"[Spark] build_main_agent 返回空结果: {umo}")
-            return None
-
-        runner = result.agent_runner
         async for _ in runner.step_until_done(30):
             pass
 
