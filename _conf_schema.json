@@ -241,6 +241,37 @@
       }
     }
   },
+  "heat_settings": {
+    "description": "对话热度",
+    "type": "object",
+    "hint": "根据最近消息密度动态调整沉寂问候触发间隔——聊得越密集，冷场后越快主动联系",
+    "items": {
+      "enable_heat": {
+        "description": "启用对话热度",
+        "hint": "开启后 hot_delay_minutes / cold_delay_minutes 取代固定的 idle_after_minutes；关闭后完全等价于原来的行为",
+        "type": "bool",
+        "default": true
+      },
+      "heat_window_hours": {
+        "description": "热度观察窗口（小时）",
+        "hint": "插件往回看多长时间的消息记录来评估热度，窗口外的消息自动淡出",
+        "type": "int",
+        "default": 4
+      },
+      "hot_delay_minutes": {
+        "description": "热场触发延迟（分钟）",
+        "hint": "热度最高（heat≈1.0，近期密集聊天）时冷场后的触发延迟，不应小于 10",
+        "type": "int",
+        "default": 30
+      },
+      "cold_delay_minutes": {
+        "description": "冷场触发延迟（分钟）",
+        "hint": "热度为零（长时间无消息）时的触发间隔，相当于原来的 idle_after_minutes 最大值",
+        "type": "int",
+        "default": 1200
+      }
+    }
+  },
   "reminders_settings": {
     "description": "命令式提醒（待废弃）",
     "type": "object",

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -70,6 +71,7 @@ def _ensure_dir(p: str) -> str:
     return p
 
 
+
 def _now_tz(tz_name: str | None) -> datetime:
     """获取指定时区的当前时间，失败则返回本地时间"""
     try:
@@ -88,6 +90,25 @@ def _now_tz(tz_name: str | None) -> datetime:
         except Exception:
             pass
     return datetime.now()
+
+
+def _compute_heat(msg_timestamps: list, now_ts: float, window_hours: float) -> float:
+    """Compute a [0.0, 1.0] conversation heat score using exponential decay.
+
+    Each message in the rolling window contributes exp(-3 * age / window_sec).
+    10 evenly-spread messages within the window yields heat ≈ 1.0.
+    Messages older than the window are excluded entirely.
+    """
+    if not msg_timestamps:
+        return 0.0
+    window_sec = window_hours * 3600.0
+    total = sum(
+        math.exp(-3.0 * (now_ts - t) / window_sec)
+        for t in msg_timestamps
+        if now_ts - t <= window_sec
+    )
+    return min(total / 10.0, 1.0)
+
 
 
 def _parse_hhmm(s: str) -> Optional[Tuple[int, int]]:
@@ -199,7 +220,8 @@ class SessionState:
     next_idle_ts: float = 0.0
     last_proactive_reply_ts: float = 0.0  # 最近一次主动回复时间戳
     last_ai_reply_ts: float = 0.0  # 最近一次 AI 普通回复时间戳（用于对话增强取消判断）
-    
+    msg_timestamps: list = None  # rolling window of user message timestamps for heat computation
+
     def __post_init__(self):
         """初始化后处理"""
         if self.last_fired_tags is None:
@@ -207,6 +229,8 @@ class SessionState:
             # 迁移旧数据
             if self.last_fired_tag:
                 self.last_fired_tags[self.last_fired_tag] = _now_tz(None).timestamp()
+        if self.msg_timestamps is None:
+            self.msg_timestamps = []
 
     def to_dict(self):
         return {
@@ -217,7 +241,8 @@ class SessionState:
             "consecutive_no_reply_count": self.consecutive_no_reply_count,
             "next_idle_ts": self.next_idle_ts,
             "last_proactive_reply_ts": self.last_proactive_reply_ts,
-            "last_ai_reply_ts": self.last_ai_reply_ts
+            "last_ai_reply_ts": self.last_ai_reply_ts,
+            "msg_timestamps": self.msg_timestamps if self.msg_timestamps else [],
         }
 
     @classmethod
@@ -225,7 +250,10 @@ class SessionState:
         tags_dict = data.get("last_fired_tags", {})
         if not isinstance(tags_dict, dict):
             tags_dict = {}
-        
+        msg_ts = data.get("msg_timestamps", [])
+        if not isinstance(msg_ts, list):
+            msg_ts = []
+
         return cls(
             last_ts=data.get("last_ts", 0.0),
             last_fired_tag=data.get("last_fired_tag", ""),
@@ -234,7 +262,8 @@ class SessionState:
             consecutive_no_reply_count=data.get("consecutive_no_reply_count", 0),
             next_idle_ts=data.get("next_idle_ts", 0.0),
             last_proactive_reply_ts=data.get("last_proactive_reply_ts", 0.0),
-            last_ai_reply_ts=data.get("last_ai_reply_ts", 0.0)
+            last_ai_reply_ts=data.get("last_ai_reply_ts", 0.0),
+            msg_timestamps=msg_ts,
         )
     
     def has_fired(self, tag: str) -> bool:
@@ -541,6 +570,27 @@ class Spark(Star):
             return default
         return group.get(sub_key, default)
 
+    def _calc_idle_delay(self, st: "SessionState", now_ts: float, profile: "UserProfile") -> float:
+        """Return the base idle-greeting delay in minutes, applying heat scaling when enabled.
+
+        When heat is disabled, falls back to the user/global idle_after_minutes setting.
+        Fluctuation is applied by the caller.
+        """
+        heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
+        if heat_enabled:
+            window_h = float(self._get_cfg("heat_settings", "heat_window_hours", 4) or 4)
+            hot_m = float(self._get_cfg("heat_settings", "hot_delay_minutes", 30) or 30)
+            cold_m = float(self._get_cfg("heat_settings", "cold_delay_minutes", 1200) or 1200)
+            heat = _compute_heat(st.msg_timestamps or [], now_ts, window_h)
+            delay_m = hot_m + (cold_m - hot_m) * (1.0 - heat)
+            logger.debug(f"[Spark] 热度计算: heat={heat:.2f}, delay={delay_m:.0f}m")
+            return delay_m
+
+        # heat disabled — use fixed setting
+        if profile.idle_after_minutes is not None:
+            return float(profile.idle_after_minutes)
+        return float(self._get_cfg("idle_greetings", "idle_after_minutes", 45) or 45)
+
     # 数据持久化
     def _load_user_data(self):
         """加载用户配置和提醒事项（从 user_data.json）"""
@@ -767,6 +817,12 @@ class Spark(Star):
         st.last_ts = now_ts
         if is_real_message:
             st.last_user_reply_ts = now_ts
+            # Append to rolling heat window (keep last 100 entries)
+            if st.msg_timestamps is None:
+                st.msg_timestamps = []
+            st.msg_timestamps.append(now_ts)
+            if len(st.msg_timestamps) > 100:
+                st.msg_timestamps = st.msg_timestamps[-100:]
         st.consecutive_no_reply_count = 0
 
         # 自动订阅模式：仅在首次创建用户时自动订阅
@@ -792,16 +848,12 @@ class Spark(Star):
         # 计算下一次延时问候触发时间
         try:
             if profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-                delay_m = profile.idle_after_minutes
-                
-                if delay_m is None:
-                    base_delay_m = int(self._get_cfg("idle_greetings", "idle_after_minutes") or 45)
-                    fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
-                    fluctuation_m = min(fluctuation_m, max(0, base_delay_m - 1))
-                    delay_m = max(1, base_delay_m + random.randint(-fluctuation_m, fluctuation_m))
-                
+                delay_m = self._calc_idle_delay(st, now_ts, profile)
+                fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
+                fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
+                delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
                 st.next_idle_ts = now_ts + delay_m * 60
-                logger.debug(f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m}m, next={st.next_idle_ts:.0f}")
+                logger.debug(f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
         except Exception as e:
             logger.warning(f"[Spark] 计算 next_idle_ts 失败: {e}")
 
@@ -824,14 +876,12 @@ class Spark(Star):
                 # Refresh idle greeting timer on every AI response
                 profile = self._user_profiles.get(umo)
                 if profile and profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-                    delay_m = profile.idle_after_minutes
-                    if delay_m is None:
-                        base_delay_m = int(self._get_cfg("idle_greetings", "idle_after_minutes") or 45)
-                        fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
-                        fluctuation_m = min(fluctuation_m, max(0, base_delay_m - 1))
-                        delay_m = max(1, base_delay_m + random.randint(-fluctuation_m, fluctuation_m))
+                    delay_m = self._calc_idle_delay(st, now_ts, profile)
+                    fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
+                    fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
+                    delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
                     st.next_idle_ts = now_ts + delay_m * 60
-                    logger.debug(f"[Spark] 沉寂计时刷新(AI回复): {umo}, delay={delay_m}m, next={st.next_idle_ts:.0f}")
+                    logger.debug(f"[Spark] 沉寂计时刷新(AI回复): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
             # Cancel any pending (sleeping) enhancement task so each LLM turn re-evaluates.
             old_task = self._enhancement_tasks.get(umo)
             if old_task and not old_task.done():
@@ -956,6 +1006,27 @@ class Spark(Star):
             debug_info.append(f"延时基准: {self._get_cfg('idle_greetings', 'idle_after_minutes', 0)}分钟")
             debug_info.append(f"最大无回复天数: {self._get_cfg('basic_settings', 'max_no_reply_days', 0)}")
             debug_info.append(f"自动重新激活: {bool(self._get_cfg('basic_settings', 'auto_resubscribe', True))}")
+
+            # Heat debug info
+            st_debug = self._states.get(umo)
+            heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
+            if heat_enabled and st_debug:
+                _window_h = float(self._get_cfg("heat_settings", "heat_window_hours", 4) or 4)
+                _heat_val = _compute_heat(st_debug.msg_timestamps or [], _now_tz(self._get_cfg("basic_settings", "timezone") or None).timestamp(), _window_h)
+                _hot_m = float(self._get_cfg("heat_settings", "hot_delay_minutes", 30) or 30)
+                _cold_m = float(self._get_cfg("heat_settings", "cold_delay_minutes", 1200) or 1200)
+                _next_delay = _hot_m + (_cold_m - _hot_m) * (1.0 - _heat_val)
+                if _heat_val >= 0.6:
+                    _heat_label = "热"
+                elif _heat_val >= 0.2:
+                    _heat_label = "温"
+                else:
+                    _heat_label = "冷"
+                debug_info.append(f"对话热度: {_heat_label}({_heat_val:.2f}) → 下次触发延迟约 {_next_delay:.0f} 分钟")
+                debug_info.append(f"热度窗口消息数: {len(st_debug.msg_timestamps or [])}")
+            elif not heat_enabled:
+                debug_info.append("对话热度: 已关闭（使用固定 idle_after_minutes）")
+
             yield reply("🔍 调试信息:\n" + "\n".join(debug_info))
             return
 
@@ -1836,6 +1907,20 @@ class Spark(Star):
             custom_prompt = getattr(self.context, "_busy_schedule_custom_prompt", "")
             _get_prompt = getattr(self.context, "_time_period_get_prompt", None)
             time_period_prompt = _get_prompt() if callable(_get_prompt) else getattr(self.context, "_time_period_current_prompt", "")
+
+            # Compute heat_level label for judge templates
+            if st:
+                _window_h = float(self._get_cfg("heat_settings", "heat_window_hours", 4) or 4)
+                _heat_val = _compute_heat(st.msg_timestamps or [], now.timestamp(), _window_h)
+            else:
+                _heat_val = 0.0
+            if _heat_val >= 0.6:
+                heat_level = "热"
+            elif _heat_val >= 0.2:
+                heat_level = "温"
+            else:
+                heat_level = "冷"
+
             try:
                 judge_prompt = judge_template.format(
                     now=now_str, last_user=last_user, last_ai=last_ai,
@@ -1843,6 +1928,7 @@ class Spark(Star):
                     today_schedule=today_schedule, outfit=outfit,
                     current_activity=current_activity, next_activity=next_activity,
                     custom_prompt=custom_prompt, time_period_prompt=time_period_prompt,
+                    heat_level=heat_level,
                 )
             except KeyError as e:
                 logger.warning(f"[Spark] Judge prompt format error: {e}")
@@ -1980,6 +2066,20 @@ class Spark(Star):
                 custom_prompt = getattr(self.context, "_busy_schedule_custom_prompt", "")
                 _get_prompt = getattr(self.context, "_time_period_get_prompt", None)
                 time_period_prompt = _get_prompt() if callable(_get_prompt) else getattr(self.context, "_time_period_current_prompt", "")
+
+                # Compute heat_level label for generation templates
+                if st:
+                    _window_h = float(self._get_cfg("heat_settings", "heat_window_hours", 4) or 4)
+                    _heat_val = _compute_heat(st.msg_timestamps or [], now.timestamp(), _window_h)
+                else:
+                    _heat_val = 0.0
+                if _heat_val >= 0.6:
+                    _heat_level = "热"
+                elif _heat_val >= 0.2:
+                    _heat_level = "温"
+                else:
+                    _heat_level = "冷"
+
                 try:
                     prompt = prompt_template.format(
                         now=now_str,
@@ -1993,6 +2093,7 @@ class Spark(Star):
                         next_activity=next_activity,
                         custom_prompt=custom_prompt,
                         time_period_prompt=time_period_prompt,
+                        heat_level=_heat_level,
                     )
                 except KeyError as e:
                     logger.warning(f"[Spark] prompt format error: {e}")
