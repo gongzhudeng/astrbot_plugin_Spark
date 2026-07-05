@@ -803,7 +803,8 @@ class Spark(Star):
 
         # 判断是否为有实际内容的真实消息（过滤输入状态等空事件）
         message_text = event.message_str.strip() if hasattr(event, 'message_str') and event.message_str else ""
-        is_real_message = bool(message_text)
+        # Commands starting with '/' are not treated as real chat messages
+        is_real_message = bool(message_text) and not message_text.startswith("/")
 
         # Enhancement task cancellation is handled inside _delayed_enhancement
         # via last_user_reply_ts check. Do NOT cancel here — it would kill tasks
@@ -845,17 +846,18 @@ class Spark(Star):
                 self._sync_subscribed_users_to_config()  # 同步到配置文件
 
 
-        # 计算下一次延时问候触发时间
-        try:
-            if profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-                delay_m = self._calc_idle_delay(st, now_ts, profile)
-                fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
-                fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
-                delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
-                st.next_idle_ts = now_ts + delay_m * 60
-                logger.debug(f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
-        except Exception as e:
-            logger.warning(f"[Spark] 计算 next_idle_ts 失败: {e}")
+        # 计算下一次延时问候触发时间（仅真实聊天消息触发，命令不重置倒计时）
+        if is_real_message:
+            try:
+                if profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
+                    delay_m = self._calc_idle_delay(st, now_ts, profile)
+                    fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
+                    fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
+                    delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
+                    st.next_idle_ts = now_ts + delay_m * 60
+                    logger.debug(f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
+            except Exception as e:
+                logger.warning(f"[Spark] 计算 next_idle_ts 失败: {e}")
 
         # 保存状态（使用去抖机制，减少高频磁盘I/O）
         await self._debounced_save_session_data()
