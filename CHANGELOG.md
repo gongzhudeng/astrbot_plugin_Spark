@@ -1,5 +1,17 @@
 # 灵犀 · 主动对话 更新日志
 
+## v1.6.3
+
+### 修复
+
+- **斜杠命令不过滤问题**：AstrBot 在分发消息给插件前会把 `wake_prefix`（即 `/`）从 `event.message_str` 剥掉，导致插件收到的永远是 `"主动状态"` 而非 `"/主动状态"`，`startswith("/")` 判断永远失效。修复方式改为从 `event.message_obj.raw_message.raw_message` 取平台原始文本，确保 `/主动状态` 等斜杠命令不会刷新热度时间戳和沉寂倒计时
+
+## v1.6.2
+
+### 修复
+
+- **斜杠命令不应重置沉寂倒计时**：`/主动状态` 等命令不再更新 `last_user_reply_ts`、`msg_timestamps`（热度）和 `next_idle_ts`
+
 ## v1.6.1
 
 ### 新增
