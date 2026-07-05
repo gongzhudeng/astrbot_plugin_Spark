@@ -801,19 +801,24 @@ class Spark(Star):
         st = self._states[umo]
         profile = self._user_profiles[umo]
 
-        # Use raw_message to detect slash commands before wake-prefix stripping.
-        # AstrBot strips the wake prefix (e.g. '/') from event.message_str before
-        # passing to plugins, so startswith('/') on message_str never fires.
-        # event.message_obj.raw_message is the original platform Event object whose
-        # .raw_message attribute holds the unmodified text, e.g. '/主动状态'.
-        _raw_obj = getattr(event.message_obj, "raw_message", None)
-        _raw_text = (getattr(_raw_obj, "raw_message", "") or "").strip()
-        message_text = _raw_text or (
+        # Determine if this is a real chat message vs. a slash command.
+        # We cannot rely on startswith('/') because AstrBot strips wake_prefix
+        # (which is '/') from event.message_str before passing to plugins.
+        # Instead, check activated_handlers: if this event activated any of
+        # Spark's own command handlers, it is a command, not real chat.
+        message_text = (
             event.message_str.strip()
             if hasattr(event, "message_str") and event.message_str
             else ""
         )
-        is_real_message = bool(message_text) and not message_text.startswith("/")
+        _activated = event.get_extra("activated_handlers") or []
+        _spark_module = __name__  # 'data.plugins.astrbot_plugin_Spark.main'
+        _is_spark_cmd = any(
+            getattr(h, "handler_module_path", "") == _spark_module
+            and getattr(h, "handler_name", "").startswith("_cmd_")
+            for h in _activated
+        )
+        is_real_message = bool(message_text) and not _is_spark_cmd
 
         # Enhancement task cancellation is handled inside _delayed_enhancement
         # via last_user_reply_ts check. Do NOT cancel here — it would kill tasks
