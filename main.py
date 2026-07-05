@@ -801,9 +801,18 @@ class Spark(Star):
         st = self._states[umo]
         profile = self._user_profiles[umo]
 
-        # 判断是否为有实际内容的真实消息（过滤输入状态等空事件）
-        message_text = event.message_str.strip() if hasattr(event, 'message_str') and event.message_str else ""
-        # Commands starting with '/' are not treated as real chat messages
+        # Use raw_message to detect slash commands before wake-prefix stripping.
+        # AstrBot strips the wake prefix (e.g. '/') from event.message_str before
+        # passing to plugins, so startswith('/') on message_str never fires.
+        # event.message_obj.raw_message is the original platform Event object whose
+        # .raw_message attribute holds the unmodified text, e.g. '/主动状态'.
+        _raw_obj = getattr(event.message_obj, "raw_message", None)
+        _raw_text = (getattr(_raw_obj, "raw_message", "") or "").strip()
+        message_text = _raw_text or (
+            event.message_str.strip()
+            if hasattr(event, "message_str") and event.message_str
+            else ""
+        )
         is_real_message = bool(message_text) and not message_text.startswith("/")
 
         # Enhancement task cancellation is handled inside _delayed_enhancement
