@@ -878,6 +878,40 @@ class Spark(Star):
         await self._debounced_save_session_data()
         await self._debounced_save_user_data()
 
+    @filter.on_llm_request()
+    async def _on_llm_request_update_ts(self, event: AstrMessageEvent, req=None):
+        """补偿时间戳：当 chat_merger 等插件吃掉第一次事件后，_on_any_message 不会被调用。
+        在 LLM 请求阶段补充更新 last_user_reply_ts 和 msg_timestamps，保证沉寂计时正常工作。
+        """
+        try:
+            if HAS_AGENT_PIPELINE and isinstance(event, CronMessageEvent):
+                return
+            umo = event.unified_msg_origin
+            st = self._states.get(umo)
+            if not st:
+                return
+            now_ts = _now_tz(self._get_cfg("basic_settings", "timezone") or None).timestamp()
+            # 仅当 _on_any_message 在这次消息中没更新过才补（防重复追加）
+            if now_ts - st.last_user_reply_ts < 2.0:
+                return
+            st.last_user_reply_ts = now_ts
+            if st.msg_timestamps is None:
+                st.msg_timestamps = []
+            st.msg_timestamps.append(now_ts)
+            if len(st.msg_timestamps) > 100:
+                st.msg_timestamps = st.msg_timestamps[-100:]
+            profile = self._user_profiles.get(umo)
+            if profile and profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
+                delay_m = self._calc_idle_delay(st, now_ts, profile)
+                fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
+                fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
+                delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
+                st.next_idle_ts = now_ts + delay_m * 60
+                logger.debug(f"[Spark] 沉寂计时刷新(llm_request补偿): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
+            await self._debounced_save_session_data()
+        except Exception as e:
+            logger.debug(f"[Spark] _on_llm_request_update_ts 异常: {e}")
+
     @filter.on_llm_response()
     async def _on_llm_response_enhancement(self, event: AstrMessageEvent, _response=None):
         """对话增强：LLM 回复后检查是否应触发短期追回复"""
