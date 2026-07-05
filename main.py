@@ -2271,8 +2271,11 @@ class Spark(Star):
         except Exception as e:
             logger.warning(f"[Spark] 获取会话失败: {e}")
 
-        # History is loaded automatically from req.conversation by build_main_agent,
-        # matching the normal conversation pipeline exactly and maximising KV cache reuse.
+        # Explicitly load the last N recent conversation rounds for proactive
+        # generation.  Keep req.conversation for persona/session/history plumbing,
+        # but do not rely on the framework to infer contexts for this custom request.
+        gen_history_rounds = self._get_cfg("proactive_settings", "gen_history_rounds", 10)
+        req.contexts = await self._get_conversation_contexts(umo, gen_history_rounds)
 
         result = await build_main_agent(
             event=cron_event,

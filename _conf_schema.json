@@ -210,8 +210,8 @@
         "default": ""
       },
       "gen_history_rounds": {
-        "description": "生成步骤上下文轮数（已废弃）",
-        "hint": "走 Agent Pipeline 时由框架自动管理完整历史，此配置不再生效",
+        "description": "生成步骤上下文轮数",
+        "hint": "主动回复生成时参考的最近真实对话轮数，数值越大越贴近上下文但消耗更多 token",
         "type": "int",
         "default": 10
       }
