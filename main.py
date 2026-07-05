@@ -221,6 +221,7 @@ class SessionState:
     last_proactive_reply_ts: float = 0.0  # 最近一次主动回复时间戳
     last_ai_reply_ts: float = 0.0  # 最近一次 AI 普通回复时间戳（用于对话增强取消判断）
     msg_timestamps: list = None  # rolling window of user message timestamps for heat computation
+    next_enhancement_ts: float = 0.0  # scheduled enhancement fire time (runtime only, not persisted)
 
     def __post_init__(self):
         """初始化后处理"""
@@ -1363,6 +1364,11 @@ class Spark(Star):
             else:
                 pending.append("  沉寂问候 → 等待触发条件")
 
+        if st and st.next_enhancement_ts > 0:
+            remaining_enh = st.next_enhancement_ts - now.timestamp()
+            if remaining_enh > 0:
+                pending.append(f"  对话增强 → 约 {int(remaining_enh / 60)} 分钟后")
+
         daily_slots = self._parse_daily_slots(now)
         for idx, actual_time, tag, slot_cfg in daily_slots:
             if st and st.has_fired(tag):
@@ -1498,6 +1504,10 @@ class Spark(Star):
         logger.info(f"[Spark] 已调度对话增强: {umo}, {delay}秒后执行")
         task = asyncio.create_task(self._delayed_enhancement(umo, delay, gen))
         self._enhancement_tasks[umo] = task
+        st = self._states.get(umo)
+        if st:
+            import time as _time
+            st.next_enhancement_ts = _time.time() + delay
 
     async def _delayed_enhancement(self, umo: str, delay: int, gen: int):
         """延迟执行对话增强回复"""
@@ -1564,6 +1574,9 @@ class Spark(Star):
             logger.error(f"[Spark] 对话增强执行出错({umo}): {e}")
         finally:
             self._enhancement_tasks.pop(umo, None)
+            st = self._states.get(umo)
+            if st:
+                st.next_enhancement_ts = 0.0
 
     # 调度器
     
