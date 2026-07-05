@@ -62,7 +62,7 @@
       },
       "idle_after_minutes": {
         "description": "沉寂基准时间（分钟）",
-        "hint": "最终触发时间 = 基准 ± 随机波动，最低 30 分钟",
+        "hint": "开启对话热度后此项不生效，改由「对话热度」的 hot/cold_delay_minutes 控制。关闭热度时：最终触发时间 = 基准 ± 随机波动，最低 30 分钟",
         "type": "int",
         "default": 1200
       },
@@ -80,6 +80,37 @@
           "日程：{today_schedule}\\n穿搭：{outfit}\\n{custom_prompt}\\n\\n[主动回复请求：现在{now}，距上次对话{time_since_last_chat}，自然地询问之前聊过话题的进展，不要提到指令的事。]\\n\\n当前活动：{current_activity}\\n下一个活动：{next_activity}"
         ],
         "items": { "type": "string" }
+      }
+    }
+  },
+  "heat_settings": {
+    "description": "对话热度",
+    "type": "object",
+    "hint": "根据最近消息密度动态调整沉寂问候触发间隔——聊得越密集，冷场后越快主动联系。开启后 idle_after_minutes 不再生效，改由下方两个端点控制触发范围",
+    "items": {
+      "enable_heat": {
+        "description": "启用对话热度",
+        "hint": "开启后 hot_delay_minutes / cold_delay_minutes 取代固定的 idle_after_minutes；关闭后完全等价于原来的行为",
+        "type": "bool",
+        "default": true
+      },
+      "heat_window_hours": {
+        "description": "热度观察窗口（小时）",
+        "hint": "插件往回看多长时间的消息记录来评估热度，窗口外的消息自动淡出",
+        "type": "int",
+        "default": 4
+      },
+      "hot_delay_minutes": {
+        "description": "热场触发延迟（分钟）",
+        "hint": "热度最高（heat≈1.0，近期密集聊天）时冷场后的触发延迟，不应小于 10",
+        "type": "int",
+        "default": 30
+      },
+      "cold_delay_minutes": {
+        "description": "冷场触发延迟（分钟）",
+        "hint": "热度为零（长时间无消息）时的触发间隔，相当于原来的 idle_after_minutes 最大值",
+        "type": "int",
+        "default": 1200
       }
     }
   },
@@ -238,37 +269,6 @@
         "hint": "ignore_dnd 时段触发时，唤醒忙碌并清空队列后等待此秒数再发送问候，让 AI 先处理完堆积消息",
         "type": "int",
         "default": 10
-      }
-    }
-  },
-  "heat_settings": {
-    "description": "对话热度",
-    "type": "object",
-    "hint": "根据最近消息密度动态调整沉寂问候触发间隔——聊得越密集，冷场后越快主动联系",
-    "items": {
-      "enable_heat": {
-        "description": "启用对话热度",
-        "hint": "开启后 hot_delay_minutes / cold_delay_minutes 取代固定的 idle_after_minutes；关闭后完全等价于原来的行为",
-        "type": "bool",
-        "default": true
-      },
-      "heat_window_hours": {
-        "description": "热度观察窗口（小时）",
-        "hint": "插件往回看多长时间的消息记录来评估热度，窗口外的消息自动淡出",
-        "type": "int",
-        "default": 4
-      },
-      "hot_delay_minutes": {
-        "description": "热场触发延迟（分钟）",
-        "hint": "热度最高（heat≈1.0，近期密集聊天）时冷场后的触发延迟，不应小于 10",
-        "type": "int",
-        "default": 30
-      },
-      "cold_delay_minutes": {
-        "description": "冷场触发延迟（分钟）",
-        "hint": "热度为零（长时间无消息）时的触发间隔，相当于原来的 idle_after_minutes 最大值",
-        "type": "int",
-        "default": 1200
       }
     }
   },
