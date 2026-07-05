@@ -932,9 +932,8 @@ class Spark(Star):
         else:
             return f"无效的操作 '{action}'，请使用 'on' 或 'off'。"
 
-    @filter.command("conversa")
     async def _cmd_conversa(self, event: AstrMessageEvent):
-        """[DEPRECATED] Legacy command entry. Use /灵犀 instead."""
+        """Internal implementation shared by /灵犀 and legacy /conversa."""
         text = (event.message_str or "").strip()
         
         # 动态处理主命令和别名
@@ -1335,19 +1334,36 @@ class Spark(Star):
         if st and st.last_user_reply_ts > 0:
             delta = now.timestamp() - st.last_user_reply_ts
             lines.append(f"距上次聊天: {_format_time_delta(delta)}")
-            if st.next_idle_ts > 0:
-                remaining = st.next_idle_ts - now.timestamp()
-                if remaining > 0:
-                    lines.append(f"下次主动问候: 约{int(remaining / 60)}分钟后")
 
         judge_enabled = self._get_cfg("proactive_settings", "proactive_judge_enable", True)
         lines.append(f"智能判断: {'开启' if judge_enabled else '关闭'}")
 
-        daily_list = self._get_cfg("daily_prompts", "daily_greetings") or []
-        active_daily = [d for d in daily_list if d.get("enable")]
-        if active_daily:
-            times = [d.get("time", "?") for d in active_daily]
-            lines.append(f"每日问候: {', '.join(times)}")
+        # --- 待触发任务 ---
+        pending = []
+        if st and st.next_idle_ts > 0:
+            remaining = st.next_idle_ts - now.timestamp()
+            if remaining > 0:
+                pending.append(f"  沉寂问候 → 约 {int(remaining / 60)} 分钟后")
+            else:
+                pending.append("  沉寂问候 → 等待触发条件")
+
+        daily_slots = self._parse_daily_slots(now)
+        for idx, actual_time, tag, slot_cfg in daily_slots:
+            if st and st.has_fired(tag):
+                continue
+            slot_dt = now.replace(hour=actual_time[0], minute=actual_time[1], second=0, microsecond=0)
+            diff_sec = (slot_dt - now).total_seconds()
+            if diff_sec > 0:
+                diff_min = int(diff_sec / 60)
+                pending.append(f"  每日问候 {actual_time[0]:02d}:{actual_time[1]:02d} → 约 {diff_min} 分钟后")
+            else:
+                pending.append(f"  每日问候 {actual_time[0]:02d}:{actual_time[1]:02d} → 等待触发条件")
+
+        if pending:
+            lines.append("待触发任务:")
+            lines.extend(pending)
+        else:
+            lines.append("待触发任务: 无")
 
         yield event.plain_result("\n".join(lines))
 
