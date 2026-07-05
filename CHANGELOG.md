@@ -1,10 +1,16 @@
 # 灵犀 · 主动对话 更新日志
 
+## v1.6.4
+
+### 修复
+
+- **真实消息检测逻辑重写**：v1.6.3 的 `raw_message` 方案在 `chat_merger` 等插件处理后 `message_obj.raw_message` 已不是原始 Event，导致真实聊天消息也被误判为命令，`last_user_reply_ts` 和热度时间戳完全停止更新。改为通过 `activated_handlers` 检查：若当前事件激活了 Spark 自身的 `_cmd_*` handler，则判定为命令；否则有文本内容即为真实消息。此方案不依赖任何文本前缀或平台内部字段，对所有消息来源均可靠
+
 ## v1.6.3
 
 ### 修复
 
-- **斜杠命令不过滤问题**：AstrBot 在分发消息给插件前会把 `wake_prefix`（即 `/`）从 `event.message_str` 剥掉，导致插件收到的永远是 `"主动状态"` 而非 `"/主动状态"`，`startswith("/")` 判断永远失效。修复方式改为从 `event.message_obj.raw_message.raw_message` 取平台原始文本，确保 `/主动状态` 等斜杠命令不会刷新热度时间戳和沉寂倒计时
+- **斜杠命令不过滤问题（初版，已被 v1.6.4 修正）**：从 `raw_message` 读取原始文本检测 `/` 前缀，但在部分消息处理链中失效
 
 ## v1.6.2
 
