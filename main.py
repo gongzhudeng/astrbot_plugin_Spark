@@ -1756,7 +1756,12 @@ class Spark(Star):
                     if is_in_dnd or is_busy:
                         continue
 
-                prompt_template = slot_cfg.get("prompt", "")
+                _prompt_raw = slot_cfg.get("prompt", "")
+                if isinstance(_prompt_raw, list):
+                    import random as _random
+                    prompt_template = _random.choice(_prompt_raw) if _prompt_raw else ""
+                else:
+                    prompt_template = _prompt_raw
                 if prompt_template:
                     logger.info(f"[Spark] 触发每日定时{slot_num}回复 {umo} (ignore_dnd={slot_cfg.get('ignore_dnd', False)})")
                     # When ignore_dnd overrides busy state: wake AI, flush queued messages first

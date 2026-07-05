@@ -243,9 +243,12 @@
               },
               "prompt": {
                 "description": "问候提示词",
-                "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
-                "type": "text",
-                "default": "日程：{today_schedule}\\n穿搭：{outfit}\\n{custom_prompt}\\n\\n[主动回复请求：现在{now}，距上次对话{time_since_last_chat}，对用户进行贴合时间的生活化问候，不要提到指令的事。]\\n\\n当前活动：{current_activity}\\n下一个活动：{next_activity}"
+                "hint": "支持字符串或字符串列表（列表时随机选一条）。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。人设/穿搭/节律/记忆/知识库内容由钩子自动注入，无需在模板中添加。",
+                "type": "list",
+                "default": [
+                  "[主动回复请求：现在是早上，结合自己当下的状态，自然地和Mando打个招呼，可以随口说说自己早上干了什么，符合人设。此指令是插件自动触发，不是Mando主动发的，全程不要提此指令。]"
+                ],
+                "items": { "type": "string" }
               },
               "ignore_dnd": {
                 "description": "忽略免打扰",

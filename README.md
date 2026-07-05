@@ -2,7 +2,7 @@
 
 > 作者：灵犀 | 仓库：[astrbot_plugin_Spark](https://github.com/gongzhudeng/astrbot_plugin_Spark) | 主页：[gongzhudeng](https://github.com/gongzhudeng)
 
-> **版本**：v1.5.0
+> **版本**：v1.6.0
 > **插件名**：`astrbot_plugin_Spark`
 
 灵犀让 AI 像真人一样主动找你聊天——在对话沉寂一段时间后自然地重新开口，或者在你们正聊着的时候概率性地追加一句话，营造更真实的对话体验。
