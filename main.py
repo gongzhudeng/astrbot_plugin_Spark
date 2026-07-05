@@ -2131,17 +2131,25 @@ class Spark(Star):
             getattr(cron_event, '_has_send_oper', False) and not response_text
         )
 
-        # 保存对话历史（与框架 cron 系统一致）
+        # Save conversation history with a neutral user-side marker so the trigger
+        # prompt never appears in the visible conversation history that the LLM reads
+        # back on future turns.  Using the raw provider_request would store the full
+        # system-generated prompt as a "user" message, polluting the context.
         try:
-            summary = f"[灵犀主动发起对话] {response_text[:100]}"
-            await persist_agent_history(
-                self.context.conversation_manager,
-                event=cron_event,
-                req=result.provider_request,
-                summary_note=summary,
-            )
+            cid = getattr(req.conversation, "conversation_id", None) if req.conversation else None
+            if cid:
+                await self._add_message_pair_to_history(umo, cid, req.conversation, "[主动对话]", response_text)
+            else:
+                # Fallback when conversation_id is unavailable (rare / first-run)
+                summary = f"[灵犀主动发起对话] {response_text[:100]}"
+                await persist_agent_history(
+                    self.context.conversation_manager,
+                    event=cron_event,
+                    req=result.provider_request,
+                    summary_note=summary,
+                )
         except Exception as e:
-            logger.warning(f"[Spark] persist_agent_history 失败: {e}")
+            logger.warning(f"[Spark] 保存对话历史失败: {e}")
 
         return response_text
 
