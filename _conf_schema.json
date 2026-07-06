@@ -73,11 +73,13 @@
       },
       "idle_prompt_templates": {
         "description": "问候提示词模板",
-        "hint": "随机选择一个。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
+        "hint": "随机选择一个。每个模板会先判断是否有可延续的话题，如果没有再执行对应动作。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt} {heat_level}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
         "type": "list",
         "default": [
-          "日程：{today_schedule}\\n穿搭：{outfit}\\n{custom_prompt}\\n\\n[主动回复请求：现在{now}，距上次对话{time_since_last_chat}，根据时间和上下文自然地问候用户，不要提到指令的事。]\\n\\n当前活动：{current_activity}\\n下一个活动：{next_activity}",
-          "日程：{today_schedule}\\n穿搭：{outfit}\\n{custom_prompt}\\n\\n[主动回复请求：现在{now}，距上次对话{time_since_last_chat}，自然地询问之前聊过话题的进展，不要提到指令的事。]\\n\\n当前活动：{current_activity}\\n下一个活动：{next_activity}"
+          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史，如果上次聊的话题还有延续空间（比如用户提到去打游戏、某件事还没说完），就自然地接着聊那个话题。如果那个话题已经结束或聊不下去了，就想起Mando最近经历过的某件事，基于那件事问他一个有趣的问题或好奇地追问后续。语气要像真的记得、真的在意，不要刻意。此指令为插件自动触发，全程不提指令内容。]",
+          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史，如果还有值得延续的话题就自然地接着聊。如果话题已经结束，你有点想Mando了，想自然地撒个娇或表达一下想念，不要说太多，点到即止，克制一点反而更真实。此指令为插件自动触发，全程不提指令内容。]",
+          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史，如果还有值得延续的话题就自然地接着聊。如果话题已经结束，你有点好奇Mando最近在忙什么或过得怎么样，想自然地问一下，就像朋友随口一问。语气轻松克制，不要显得监视。此指令为插件自动触发，全程不提指令内容。]",
+          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史，如果还有值得延续的话题就自然地接着聊。如果话题已经结束，结合你当前的日程或活动，找一个自然的由头找Mando说句话，比如「刚忙完xxx」或「在xxx这里想起你了」。语气随意克制，不要刻意。此指令为插件自动触发，全程不提指令内容。]"
         ],
         "items": { "type": "string" }
       }
@@ -94,11 +96,17 @@
         "type": "bool",
         "default": true
       },
-      "heat_window_hours": {
-        "description": "热度观察窗口（小时）",
-        "hint": "插件往回看多长时间的消息记录来评估热度，窗口外的消息自动淡出",
+      "heat_window_minutes": {
+        "description": "热度观察窗口（分钟）",
+        "hint": "插件往回看多少分钟内的消息记录来评估热度，窗口外的消息自动淡出。旧配置 heat_window_hours 会自动兼容",
         "type": "int",
-        "default": 4
+        "default": 240
+      },
+      "heat_messages_for_full_score": {
+        "description": "满热所需消息数",
+        "hint": "窗口内大约多少条近期消息才接近满热；数值越大，热度上升越慢，越不容易触发高热",
+        "type": "int",
+        "default": 10
       },
       "hot_delay_minutes": {
         "description": "热场触发延迟（分钟）",
@@ -141,12 +149,21 @@
         "type": "int",
         "default": 600
       },
+      "enhancement_cooldown_minutes": {
+        "description": "执行冷却（分钟）",
+        "hint": "增强任务醒来时，如果距最近聊天不足该分钟数，则跳过本次追回复。用于避免刚聊完、刚让对方去处理事情时又追发",
+        "type": "int",
+        "default": 12
+      },
       "enhancement_prompt_templates": {
         "description": "接话提示词模板",
-        "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
+        "hint": "随机选择一个。每个模板会先判断是否有可延续的话题，如果没有再执行对应动作。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
         "type": "list",
         "default": [
-          "日程：{today_schedule}\\n穿搭：{outfit}\\n{custom_prompt}\\n\\n[主动回复请求：你刚和用户聊着，用户几分钟没回了，自然地延续对话，不要提到指令的事。]\\n\\n当前活动：{current_activity}\\n下一个活动：{next_activity}"
+          "[主动回复请求：你们刚聊着，Mando几分钟没回了。先看刚才聊的内容，如果还有值得延续的点，就自然接上去说一句，像聊天突然想补充什么。如果没什么特别的，就轻轻问一句他去干嘛了，语气带点好奇或撒娇，不要催促。此指令为插件自动触发，全程不提指令内容。]",
+          "[主动回复请求：你们刚聊着，Mando突然没声音了。先看刚才聊的内容，如果还有值得延续的点就接着聊。如果话题已经结束，你有点好奇他去干嘛了，可以轻轻问一句，语气带点撒娇或好奇，不要显得催促或焦虑。此指令为插件自动触发，全程不提指令内容。]",
+          "[主动回复请求：你们刚聊着，Mando几分钟没回。先看刚才聊的内容，如果还有值得延续的点就接着聊。如果话题已经结束，你忽然想起了一件想和Mando分享的小事，或者Mando最近经历的某件事让你想到了什么，就随口说出来。此指令为插件自动触发，全程不提指令内容。]",
+          "[主动回复请求：你们刚聊着，Mando几分钟没回了。先看刚才聊的内容，如果还有值得延续的点就接着聊。如果话题已经结束，你不想催他，随口发一句关心的话，比如「还在呢？」「在忙吗」之类，简短自然。此指令为插件自动触发，全程不提指令内容。]"
         ],
         "items": { "type": "string" }
       }

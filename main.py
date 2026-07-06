@@ -92,22 +92,19 @@ def _now_tz(tz_name: str | None) -> datetime:
     return datetime.now()
 
 
-def _compute_heat(msg_timestamps: list, now_ts: float, window_hours: float) -> float:
-    """Compute a [0.0, 1.0] conversation heat score using exponential decay.
-
-    Each message in the rolling window contributes exp(-3 * age / window_sec).
-    10 evenly-spread messages within the window yields heat ≈ 1.0.
-    Messages older than the window are excluded entirely.
-    """
+def _compute_heat(msg_timestamps: list, now_ts: float, window_minutes: float, full_score_messages: float = 10.0) -> float:
+    """Compute a [0.0, 1.0] conversation heat score using exponential decay."""
     if not msg_timestamps:
         return 0.0
-    window_sec = window_hours * 3600.0
+    window_minutes = max(float(window_minutes or 1), 1.0)
+    full_score_messages = max(float(full_score_messages or 10), 1.0)
+    window_sec = window_minutes * 60.0
     total = sum(
         math.exp(-3.0 * (now_ts - t) / window_sec)
         for t in msg_timestamps
-        if now_ts - t <= window_sec
+        if 0 <= now_ts - t <= window_sec
     )
-    return min(total / 10.0, 1.0)
+    return min(total / full_score_messages, 1.0)
 
 
 
@@ -429,8 +426,23 @@ class Spark(Star):
             proactive = self.cfg.get("proactive_settings") or {}
             basic = self.cfg.get("basic_settings") or {}
             advanced = self.cfg.get("advanced") or {}
+            heat = self.cfg.get("heat_settings") or {}
+            enhancement = self.cfg.get("enhancement") or {}
 
-            # Migrate advanced.* -> proactive_settings.*
+            if isinstance(heat, dict):
+                if "heat_window_minutes" not in heat:
+                    heat["heat_window_minutes"] = int(float(heat.get("heat_window_hours", 4) or 4) * 60)
+                    changed = True
+                    logger.info("[Spark] migrated heat_window_hours -> heat_window_minutes")
+                if "heat_messages_for_full_score" not in heat:
+                    heat["heat_messages_for_full_score"] = 10
+                    changed = True
+                self.cfg["heat_settings"] = heat
+
+            if isinstance(enhancement, dict) and "enhancement_cooldown_minutes" not in enhancement:
+                enhancement["enhancement_cooldown_minutes"] = 12
+                self.cfg["enhancement"] = enhancement
+                changed = True
             if advanced.get("fixed_provider") and not proactive.get("fixed_provider"):
                 proactive["fixed_provider"] = advanced["fixed_provider"]
                 changed = True
@@ -571,6 +583,20 @@ class Spark(Star):
             return default
         return group.get(sub_key, default)
 
+    def _get_heat_args(self) -> tuple[float, float]:
+        heat_cfg = self.cfg.get("heat_settings") or {}
+        if not isinstance(heat_cfg, dict):
+            heat_cfg = {}
+        window_minutes = heat_cfg.get("heat_window_minutes")
+        if window_minutes is None:
+            window_minutes = float(heat_cfg.get("heat_window_hours", 4) or 4) * 60.0
+        full_score_messages = float(heat_cfg.get("heat_messages_for_full_score", 10) or 10)
+        return max(float(window_minutes or 1), 1.0), max(full_score_messages, 1.0)
+
+    def _calc_heat(self, st: "SessionState", now_ts: float) -> float:
+        window_m, full_score_messages = self._get_heat_args()
+        return _compute_heat(st.msg_timestamps or [], now_ts, window_m, full_score_messages)
+
     def _calc_idle_delay(self, st: "SessionState", now_ts: float, profile: "UserProfile") -> float:
         """Return the base idle-greeting delay in minutes, applying heat scaling when enabled.
 
@@ -579,10 +605,9 @@ class Spark(Star):
         """
         heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
         if heat_enabled:
-            window_h = float(self._get_cfg("heat_settings", "heat_window_hours", 4) or 4)
             hot_m = float(self._get_cfg("heat_settings", "hot_delay_minutes", 30) or 30)
             cold_m = float(self._get_cfg("heat_settings", "cold_delay_minutes", 1200) or 1200)
-            heat = _compute_heat(st.msg_timestamps or [], now_ts, window_h)
+            heat = self._calc_heat(st, now_ts)
             delay_m = hot_m + (cold_m - hot_m) * (1.0 - heat)
             logger.debug(f"[Spark] 热度计算: heat={heat:.2f}, delay={delay_m:.0f}m")
             return delay_m
@@ -1061,8 +1086,8 @@ class Spark(Star):
             st_debug = self._states.get(umo)
             heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
             if heat_enabled and st_debug:
-                _window_h = float(self._get_cfg("heat_settings", "heat_window_hours", 4) or 4)
-                _heat_val = _compute_heat(st_debug.msg_timestamps or [], _now_tz(self._get_cfg("basic_settings", "timezone") or None).timestamp(), _window_h)
+                _window_m, _full_score_messages = self._get_heat_args()
+                _heat_val = self._calc_heat(st_debug, _now_tz(self._get_cfg("basic_settings", "timezone") or None).timestamp())
                 _hot_m = float(self._get_cfg("heat_settings", "hot_delay_minutes", 30) or 30)
                 _cold_m = float(self._get_cfg("heat_settings", "cold_delay_minutes", 1200) or 1200)
                 _next_delay = _hot_m + (_cold_m - _hot_m) * (1.0 - _heat_val)
@@ -1073,7 +1098,7 @@ class Spark(Star):
                 else:
                     _heat_label = "冷"
                 debug_info.append(f"对话热度: {_heat_label}({_heat_val:.2f}) → 下次触发延迟约 {_next_delay:.0f} 分钟")
-                debug_info.append(f"热度窗口消息数: {len(st_debug.msg_timestamps or [])}")
+                debug_info.append(f"热度窗口: {int(_window_m)} 分钟，满热约需 {_full_score_messages:.0f} 条消息，记录消息数: {len(st_debug.msg_timestamps or [])}")
             elif not heat_enabled:
                 debug_info.append("对话热度: 已关闭（使用固定 idle_after_minutes）")
 
@@ -1551,8 +1576,8 @@ class Spark(Star):
             if not st:
                 logger.info(f"[Spark] 增强任务退出: {umo} (无SessionState)")
                 return
-            trigger_user_ts = st.last_user_reply_ts
-            logger.info(f"[Spark] 增强任务sleep: {umo}, trigger_user_ts={trigger_user_ts}")
+            trigger_chat_ts = max(st.last_user_reply_ts, st.last_ai_reply_ts, st.last_proactive_reply_ts)
+            logger.info(f"[Spark] 增强任务sleep: {umo}, trigger_chat_ts={trigger_chat_ts}")
 
             await asyncio.sleep(delay)
 
@@ -1572,6 +1597,15 @@ class Spark(Star):
             
             # 执行时检查免打扰（延迟期间可能已进入免打扰时段）
             now = _now_tz(tz)
+            now_ts = now.timestamp()
+            latest_chat_ts = max(st.last_user_reply_ts, st.last_ai_reply_ts, st.last_proactive_reply_ts)
+            if latest_chat_ts > trigger_chat_ts + 1.0:
+                logger.info(f"[Spark] 增强任务退出: {umo} (等待期间已有新聊天)")
+                return
+            cooldown = int(self._get_cfg("enhancement", "enhancement_cooldown_minutes", 12) or 12) * 60
+            if cooldown > 0 and latest_chat_ts > 0 and now_ts - latest_chat_ts < cooldown:
+                logger.info(f"[Spark] 增强任务退出: {umo} (距最近聊天不足冷却时间, {int(now_ts - latest_chat_ts)}s < {cooldown}s)")
+                return
             quiet = self._get_cfg("basic_settings", "quiet_hours", "") or ""
             user_quiet = profile.quiet_hours if profile.quiet_hours else quiet
             if _in_quiet(now, user_quiet):
@@ -1994,8 +2028,7 @@ class Spark(Star):
 
             # Compute heat_level label for judge templates
             if st:
-                _window_h = float(self._get_cfg("heat_settings", "heat_window_hours", 4) or 4)
-                _heat_val = _compute_heat(st.msg_timestamps or [], now.timestamp(), _window_h)
+                _heat_val = self._calc_heat(st, now.timestamp())
             else:
                 _heat_val = 0.0
             if _heat_val >= 0.6:
@@ -2111,6 +2144,60 @@ class Spark(Star):
             persona = await self._get_current_persona_prompt(umo)
         return persona
 
+    def _build_proactive_prompt_envelope(
+        self,
+        *,
+        prompt: str,
+        now_str: str,
+        time_since_last_chat: str,
+        last_user: str,
+        last_ai: str,
+    ) -> str:
+        today_schedule = getattr(self.context, "_busy_schedule_today_schedule", "")
+        outfit = getattr(self.context, "_busy_schedule_outfit", "")
+        current_activity = getattr(self.context, "_busy_schedule_current_activity", "")
+        next_activity = getattr(self.context, "_busy_schedule_next_activity", "")
+        custom_prompt = getattr(self.context, "_busy_schedule_custom_prompt", "")
+        _get_prompt = getattr(self.context, "_time_period_get_prompt", None)
+        time_period_prompt = _get_prompt() if callable(_get_prompt) else getattr(self.context, "_time_period_current_prompt", "")
+        facts = [
+            "[主动回复实时事实]",
+            f"当前时间：{now_str}",
+            f"距上次聊天：{time_since_last_chat}",
+            f"最近Mando消息：{last_user or '无'}",
+            f"最近AI回复：{last_ai or '无'}",
+        ]
+        if today_schedule:
+            facts.append(f"今日日程：{today_schedule}")
+        if current_activity:
+            facts.append(f"当前活动：{current_activity}")
+        if next_activity:
+            facts.append(f"下一个活动：{next_activity}")
+        if outfit:
+            facts.append(f"当前穿搭：{outfit}")
+        if time_period_prompt:
+            facts.append(f"当前节律：{time_period_prompt}")
+        if custom_prompt:
+            facts.append(f"附加状态：{custom_prompt}")
+        facts.append("事实优先级：当前时间、当前活动、当前节律、最近真实对话优先于长期记忆和知识库。长期记忆/知识库只能作为背景补充，不能当作今天刚发生的事；如果与当前事实冲突，必须忽略旧内容。")
+        facts.append("[/主动回复实时事实]")
+        return "\n".join(facts) + "\n\n" + prompt
+
+    def _build_proactive_retrieval_query(self, contexts: list, prompt: str) -> str:
+        recent_lines = []
+        for msg in contexts[-6:]:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "")
+            content = str(msg.get("content", "")).strip()
+            if not content or content == "[主动对话]":
+                continue
+            speaker = "Mando" if role == "user" else "AI"
+            recent_lines.append(f"{speaker}: {content[:300]}")
+        if recent_lines:
+            return "最近真实聊天内容，用于召回相关记忆和知识库；不要把主动回复指令本身当作查询主题：\n" + "\n".join(recent_lines)
+        return prompt
+
     async def _proactive_reply(self, umo: str, tz: Optional[str], prompt_template: str, skip_judge: bool = False) -> bool:
         """
         执行主动回复的核心方法
@@ -2153,8 +2240,7 @@ class Spark(Star):
 
                 # Compute heat_level label for generation templates
                 if st:
-                    _window_h = float(self._get_cfg("heat_settings", "heat_window_hours", 4) or 4)
-                    _heat_val = _compute_heat(st.msg_timestamps or [], now.timestamp(), _window_h)
+                    _heat_val = self._calc_heat(st, now.timestamp())
                 else:
                     _heat_val = 0.0
                 if _heat_val >= 0.6:
@@ -2184,6 +2270,14 @@ class Spark(Star):
                     prompt = prompt_template
             else:
                 prompt = "请自然地延续对话，与用户继续交流。"
+
+            prompt = self._build_proactive_prompt_envelope(
+                prompt=prompt,
+                now_str=now_str,
+                time_since_last_chat=time_since_last_chat,
+                last_user=last_user,
+                last_ai=last_ai,
+            )
 
             logger.info(f"[Spark] 准备主动回复 {umo}")
 
@@ -2277,12 +2371,17 @@ class Spark(Star):
         gen_history_rounds = self._get_cfg("proactive_settings", "gen_history_rounds", 10)
         req.contexts = await self._get_conversation_contexts(umo, gen_history_rounds)
 
+        retrieval_query = self._build_proactive_retrieval_query(req.contexts, prompt)
+        generation_prompt = prompt
+        req.prompt = retrieval_query
+
         result = await build_main_agent(
             event=cron_event,
             plugin_context=self.context,
             config=config,
             provider=provider,
             req=req,
+            apply_reset=False,
         )
 
         if not result or not result.agent_runner:
@@ -2299,6 +2398,11 @@ class Spark(Star):
                 await call_event_hook(cron_event, EventType.OnLLMRequestEvent, req)
             except Exception as e:
                 logger.warning(f"[Spark] 触发 OnLLMRequestEvent 钩子失败: {e}")
+
+        req.prompt = generation_prompt
+        cron_event.message_str = generation_prompt
+        if result.reset_coro:
+            await result.reset_coro
 
         async for _ in runner.step_until_done(30):
             pass
