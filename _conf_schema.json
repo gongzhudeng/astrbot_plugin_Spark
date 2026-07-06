@@ -231,6 +231,13 @@
         "hint": "主动回复生成时参考的最近真实对话轮数，数值越大越贴近上下文但消耗更多 token",
         "type": "int",
         "default": 10
+      },
+      "proactive_fact_envelope_mode": {
+        "description": "主动事实附加模式",
+        "hint": "minimal=默认，仅强调这是AI主动开口；off=不附加额外说明；full=附加完整实时事实用于压制旧记忆/知识库跑偏，但会增加动态token",
+        "type": "string",
+        "options": ["off", "minimal", "full"],
+        "default": "minimal"
       }
     }
   },

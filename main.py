@@ -1407,6 +1407,25 @@ class Spark(Star):
         is_busy = getattr(self.context, '_busy_schedule_is_busy', False)
         lines.append(f"忙碌时段: {'是' if is_busy else '否'}")
 
+        heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
+        if heat_enabled:
+            window_m, _full_score_messages = self._get_heat_args()
+            now_ts = now.timestamp()
+            heat_val = self._calc_heat(st, now_ts) if st else 0.0
+            if heat_val >= 0.6:
+                heat_label = "热"
+            elif heat_val >= 0.2:
+                heat_label = "温"
+            else:
+                heat_label = "冷"
+            window_sec = float(window_m) * 60.0
+            recent_msg_count = 0
+            if st and st.msg_timestamps:
+                recent_msg_count = sum(1 for ts in st.msg_timestamps if 0 <= now_ts - ts <= window_sec)
+            lines.append(f"当前热度: {heat_label}({heat_val:.2f})，{int(window_m)}分钟内 {recent_msg_count} 条消息")
+        else:
+            lines.append("当前热度: 已关闭（使用固定沉寂延迟）")
+
         if st and st.last_user_reply_ts > 0:
             delta = now.timestamp() - st.last_user_reply_ts
             lines.append(f"距上次聊天: {_format_time_delta(delta)}")
@@ -2153,6 +2172,21 @@ class Spark(Star):
         last_user: str,
         last_ai: str,
     ) -> str:
+        mode = str(self._get_cfg("proactive_settings", "proactive_fact_envelope_mode", "minimal") or "minimal").lower()
+        if mode == "off":
+            return prompt
+
+        if mode != "full":
+            stance = [
+                "[主动回复姿态]",
+                "本轮是 AI 主动开口，不是 Mando 新发来消息后等待回复。",
+                "最近对话只作为历史上下文；不要把最近一条 Mando 消息当成刚刚收到的提问、催促或要求。",
+                f"距上次聊天：{time_since_last_chat}",
+                "回复要像你自己想起话题后主动找 Mando，而不是回答 Mando 刚刚问你。",
+                "[/主动回复姿态]",
+            ]
+            return "\n".join(stance) + "\n\n" + prompt
+
         today_schedule = getattr(self.context, "_busy_schedule_today_schedule", "")
         outfit = getattr(self.context, "_busy_schedule_outfit", "")
         current_activity = getattr(self.context, "_busy_schedule_current_activity", "")
@@ -2162,6 +2196,8 @@ class Spark(Star):
         time_period_prompt = _get_prompt() if callable(_get_prompt) else getattr(self.context, "_time_period_current_prompt", "")
         facts = [
             "[主动回复实时事实]",
+            "本轮是 AI 主动开口，不是 Mando 新发来消息后等待回复。",
+            "最近对话只作为历史上下文；不要把最近一条 Mando 消息当成刚刚收到的提问、催促或要求。",
             f"当前时间：{now_str}",
             f"距上次聊天：{time_since_last_chat}",
             f"最近Mando消息：{last_user or '无'}",
@@ -2183,20 +2219,41 @@ class Spark(Star):
         facts.append("[/主动回复实时事实]")
         return "\n".join(facts) + "\n\n" + prompt
 
+    def _is_natural_retrieval_line(self, content: str) -> bool:
+        stripped = content.strip()
+        if not stripped or stripped == "[主动对话]":
+            return False
+        blocked_markers = (
+            "[主动回复实时事实]",
+            "[/主动回复实时事实]",
+            "[主动回复姿态]",
+            "[/主动回复姿态]",
+            "主动回复请求",
+            "正在发送主动消息",
+            "Output your last task result",
+        )
+        if any(marker in stripped for marker in blocked_markers):
+            return False
+        if stripped.startswith("/"):
+            return False
+        return True
+
     def _build_proactive_retrieval_query(self, contexts: list, prompt: str) -> str:
         recent_lines = []
-        for msg in contexts[-6:]:
+        for msg in contexts[-8:]:
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role", "")
             content = str(msg.get("content", "")).strip()
-            if not content or content == "[主动对话]":
+            if not self._is_natural_retrieval_line(content):
                 continue
             speaker = "Mando" if role == "user" else "AI"
-            recent_lines.append(f"{speaker}: {content[:300]}")
+            recent_lines.append(f"{speaker}: {content[:220]}")
         if recent_lines:
-            return "最近真实聊天内容，用于召回相关记忆和知识库；不要把主动回复指令本身当作查询主题：\n" + "\n".join(recent_lines)
-        return prompt
+            query = "最近聊天：\n" + "\n".join(recent_lines[-4:])
+        else:
+            query = "主动找 Mando 自然延续最近聊天"
+        return query[:900]
 
     async def _proactive_reply(self, umo: str, tz: Optional[str], prompt_template: str, skip_judge: bool = False) -> bool:
         """
