@@ -1,5 +1,13 @@
 # 灵犀 · 主动对话 更新日志
 
+## v1.6.8
+
+### 修复
+
+- **主动历史占位符语义修复**：主动对话存入历史时，user 侧从无意义的 `[主动对话]` 改为语义清晰的描述，让模型能正确认领"那条 assistant 消息是我自发发出的"，而不是将其误认为对某条 Mando 消息的回复
+- **livingmemory 对话污染修复**：在触发 `OnLLMRequestEvent` 钩子前，临时将 `cron_event.message_str` 替换为干净占位符，使 livingmemory 写入 conversation store 的是占位符而非完整主动触发 prompt；钩子完成后立即恢复生成 prompt，不影响记忆检索效果
+- **检索过滤同步**：`_is_natural_retrieval_line` 新增对 `[灵犀主动` 前缀的拦截，防止新占位符混入检索 query
+
 ## v1.6.7
 
 ### 修复

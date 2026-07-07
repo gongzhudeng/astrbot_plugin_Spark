@@ -2221,7 +2221,7 @@ class Spark(Star):
 
     def _is_natural_retrieval_line(self, content: str) -> bool:
         stripped = content.strip()
-        if not stripped or stripped == "[主动对话]":
+        if not stripped or stripped == "[主动对话]" or stripped.startswith("[灵犀主动"):
             return False
         blocked_markers = (
             "[主动回复实时事实]",
@@ -2450,8 +2450,14 @@ class Spark(Star):
         # Fire on_llm_request hooks BEFORE the LLM call so that plugins like
         # livingmemory, knowledge_base, and time_period_prompt can inject their
         # content into req — identical to the normal conversation pipeline.
+        #
+        # Temporarily mask cron_event.message_str with a clean placeholder so that
+        # livingmemory's add_message_from_event() writes the placeholder into the
+        # conversation store instead of the full proactive trigger prompt.
+        # The full generation prompt is restored immediately after hooks complete.
         if HAS_EVENT_HOOK:
             try:
+                cron_event.message_str = "[灵犀主动开口，我主动找Mando发起，本轮无Mando新消息触发]"
                 await call_event_hook(cron_event, EventType.OnLLMRequestEvent, req)
             except Exception as e:
                 logger.warning(f"[Spark] 触发 OnLLMRequestEvent 钩子失败: {e}")
@@ -2487,7 +2493,7 @@ class Spark(Star):
         try:
             cid = getattr(req.conversation, "conversation_id", None) if req.conversation else None
             if cid:
-                await self._add_message_pair_to_history(umo, cid, req.conversation, "[主动对话]", response_text)
+                await self._add_message_pair_to_history(umo, cid, req.conversation, "[灵犀主动开口，我主动找Mando发起，本轮无Mando新消息触发]", response_text)
             else:
                 # Fallback when conversation_id is unavailable (rare / first-run)
                 summary = f"[灵犀主动发起对话] {response_text[:100]}"
