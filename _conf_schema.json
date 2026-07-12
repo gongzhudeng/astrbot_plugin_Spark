@@ -226,6 +226,30 @@
         "_special": "select_persona",
         "default": ""
       },
+      "retrieval_mode": {
+        "description": "主动检索模式",
+        "hint": "控制记忆库和知识库使用什么内容搜索。仅自定义检索提示词适合固定探索用户经历；最终回复始终保留正常对话上下文",
+        "type": "string",
+        "options": [
+          "仅最近对话",
+          "仅自定义检索提示词",
+          "最近对话 + 自定义检索提示词",
+          "最近对话 + 完整生成指令"
+        ],
+        "default": "最近对话 + 自定义检索提示词"
+      },
+      "retrieval_hint": {
+        "description": "全局检索提示词",
+        "hint": "只用于记忆库和知识库搜索，不作为最终回复指令。所有主动模式共用",
+        "type": "text",
+        "default": "用户最近的经历、近况、未完成的话题"
+      },
+      "retrieval_query_max_chars": {
+        "description": "主动检索字数上限",
+        "hint": "记忆库和知识库检索 query 的总字数。检索提示词优先，调低后主要减少最近对话。有效范围 100-4000",
+        "type": "int",
+        "default": 800
+      },
       "proactive_user_placeholder": {
         "description": "主动历史占位用户消息",
         "hint": "主动回复没有真实用户发言时，写入对话历史的 user 占位文本。用于让主动回复像普通对话一样形成 user/assistant 轮次",

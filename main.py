@@ -48,14 +48,19 @@ except ImportError:
 # 导入官方 Agent Pipeline API（用于主动回复走合规调用）
 try:
     from astrbot.core.cron.events import CronMessageEvent
-    from astrbot.core.astr_main_agent import build_main_agent, MainAgentBuildConfig
+    from astrbot.core.astr_main_agent import (
+        build_main_agent,
+        build_main_agent_config,
+    )
     from astrbot.core.provider.entities import ProviderRequest
     from astrbot.core.platform.message_session import MessageSession
     from astrbot.core.pipeline.context import call_event_hook
     from astrbot.core.star.star_handler import EventType
     HAS_AGENT_PIPELINE = True
-except ImportError:
+    AGENT_PIPELINE_IMPORT_ERROR = ""
+except ImportError as exc:
     HAS_AGENT_PIPELINE = False
+    AGENT_PIPELINE_IMPORT_ERROR = repr(exc)
 
 # 工具函数
 def _ensure_dir(p: str) -> str:
@@ -336,6 +341,7 @@ class Spark(Star):
         # 对话增强相关
         self._enhancement_tasks: Dict[str, asyncio.Task] = {}
         self._enhancement_gen: Dict[str, int] = {}  # generation counter per umo
+        self._heat_event_marker = "_spark_heat_counted"
         
         # 数据文件路径（使用规范的方式获取插件数据目录）
         if HAS_STARTOOLS:
@@ -865,12 +871,13 @@ class Spark(Star):
         st.last_ts = now_ts
         if is_real_message:
             st.last_user_reply_ts = now_ts
-            # Append to rolling heat window (keep last 100 entries)
-            if st.msg_timestamps is None:
-                st.msg_timestamps = []
-            st.msg_timestamps.append(now_ts)
-            if len(st.msg_timestamps) > 100:
-                st.msg_timestamps = st.msg_timestamps[-100:]
+            if not event.get_extra(self._heat_event_marker, False):
+                if st.msg_timestamps is None:
+                    st.msg_timestamps = []
+                st.msg_timestamps.append(now_ts)
+                if len(st.msg_timestamps) > 100:
+                    st.msg_timestamps = st.msg_timestamps[-100:]
+                event.set_extra(self._heat_event_marker, True)
         st.consecutive_no_reply_count = 0
 
         # 自动订阅模式：仅在首次创建用户时自动订阅
@@ -922,16 +929,16 @@ class Spark(Star):
             st = self._states.get(umo)
             if not st:
                 return
-            now_ts = _now_tz(self._get_cfg("basic_settings", "timezone") or None).timestamp()
-            # 仅当 _on_any_message 在这次消息中没更新过才补（防重复追加）
-            if now_ts - st.last_user_reply_ts < 2.0:
+            if event.get_extra(self._heat_event_marker, False):
                 return
+            now_ts = _now_tz(self._get_cfg("basic_settings", "timezone") or None).timestamp()
             st.last_user_reply_ts = now_ts
             if st.msg_timestamps is None:
                 st.msg_timestamps = []
             st.msg_timestamps.append(now_ts)
             if len(st.msg_timestamps) > 100:
                 st.msg_timestamps = st.msg_timestamps[-100:]
+            event.set_extra(self._heat_event_marker, True)
             profile = self._user_profiles.get(umo)
             if profile and profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
                 delay_m = self._calc_idle_delay(st, now_ts, profile)
@@ -2264,8 +2271,25 @@ class Spark(Star):
         facts.append("[/主动回复实时事实]")
         return "\n".join(facts) + "\n\n" + prompt
 
+    def _proactive_placeholder(self) -> str:
+        return (
+            self._get_cfg("proactive_settings", "proactive_user_placeholder")
+            or "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]"
+        )
+
+    def _is_proactive_placeholder(self, content: str) -> bool:
+        normalized = self._normalize_history_text(content)
+        known_placeholders = {
+            self._normalize_history_text(self._proactive_placeholder()),
+            "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]",
+            "[用户本人未说话，本轮为 AI 主动发起对话]",
+        }
+        return normalized in known_placeholders
+
     def _is_natural_retrieval_line(self, content: str) -> bool:
         stripped = content.strip()
+        if self._is_proactive_placeholder(stripped):
+            return True
         if not stripped or stripped == "[主动对话]" or stripped.startswith("[灵犀主动"):
             return False
         blocked_markers = (
@@ -2285,37 +2309,208 @@ class Spark(Star):
             return False
         return True
 
+    def _sanitize_retrieval_user_content(self, content: str) -> str:
+        stripped = str(content or "").strip()
+        if not stripped or self._is_proactive_placeholder(stripped):
+            return stripped
+
+        internal_block_starts = (
+            "[节律：",
+            "[主动回复实时事实]",
+            "[主动回复姿态]",
+        )
+        cut_positions = []
+        for marker in internal_block_starts:
+            start = stripped.find(marker)
+            if start == 0:
+                return ""
+            if start > 0:
+                cut_positions.append(start)
+        if cut_positions:
+            stripped = stripped[: min(cut_positions)].rstrip()
+
+        return "" if self._is_internal_history_noise("user", stripped) else stripped
+
     def _build_proactive_retrieval_query(self, contexts: list, prompt: str) -> str:
-        recent_lines = []
-        for msg in contexts[-8:]:
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role", "")
-            content = str(msg.get("content", "")).strip()
-            if not self._is_natural_retrieval_line(content):
-                continue
-            speaker = "Mando" if role == "user" else "AI"
-            recent_lines.append(f"{speaker}: {content[:220]}")
-        if recent_lines:
-            query = "最近聊天：\n" + "\n".join(recent_lines[-4:])
-        else:
-            query = "主动找 Mando 自然延续最近聊天"
+        configured_budget = self._get_cfg(
+            "proactive_settings",
+            "retrieval_query_max_chars",
+            800,
+        )
+        try:
+            total_budget = max(100, min(4000, int(configured_budget)))
+        except (TypeError, ValueError):
+            total_budget = 800
+        max_rounds = 4
+        proactive_marker = "[主动轮] 用户未发送新消息"
+        mode_labels = {
+            "仅最近对话": "recent_context",
+            "仅自定义检索提示词": "retrieval_hint",
+            "最近对话 + 自定义检索提示词": "recent_context_and_hint",
+            "最近对话 + 完整生成指令": "recent_context_and_instruction",
+        }
+        configured_mode = self._get_cfg(
+            "proactive_settings",
+            "retrieval_mode",
+            "最近对话 + 自定义检索提示词",
+        )
+        mode = mode_labels.get(configured_mode, configured_mode)
+        valid_modes = set(mode_labels.values())
+        if mode not in valid_modes:
+            mode = "recent_context_and_hint"
 
-        # 从包装后的 prompt 里提取模板指令原文，追加到检索 query，
-        # 使知识库/记忆能根据指令意图（而不只是聊天历史）召回相关内容。
-        instruction_text = ""
-        for end_tag in ("[/主动回复姿态]\n\n", "[/主动回复实时事实]\n\n"):
-            idx = prompt.find(end_tag)
-            if idx != -1:
-                instruction_text = prompt[idx + len(end_tag):].strip()
-                break
-        if not instruction_text:
-            # 没有包装标签时 prompt 本身就是指令
-            instruction_text = prompt.strip()
-        if instruction_text:
-            query = query + "\n\n[模板指令：" + instruction_text[:150] + "]"
+        include_history = mode != "retrieval_hint"
+        retrieval_text = ""
+        retrieval_label = ""
+        if mode in ("retrieval_hint", "recent_context_and_hint"):
+            retrieval_text = str(
+                self._get_cfg(
+                    "proactive_settings",
+                    "retrieval_hint",
+                    "用户最近的经历、近况、未完成的话题",
+                )
+                or "用户最近的经历、近况、未完成的话题"
+            ).strip()
+            retrieval_label = "检索提示"
+        elif mode == "recent_context_and_instruction":
+            for end_tag in (
+                "[/主动回复姿态]\n\n",
+                "[/主动回复实时事实]\n\n",
+            ):
+                idx = prompt.find(end_tag)
+                if idx != -1:
+                    retrieval_text = prompt[idx + len(end_tag) :].strip()
+                    break
+            if not retrieval_text:
+                retrieval_text = prompt.strip()
+            retrieval_label = "模板指令"
 
-        return query[:900]
+        retrieval_block = (
+            f"[{retrieval_label}：{retrieval_text}]"
+            if retrieval_text and retrieval_label
+            else ""
+        )
+        retrieval_truncated = len(retrieval_block) > total_budget
+        if retrieval_truncated:
+            suffix = retrieval_block[-(total_budget - 8) :]
+            retrieval_block = "[已截断]" + suffix
+
+        candidate_rounds = []
+        current_round = None
+        if include_history:
+            for msg in contexts:
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role", "")
+                content = self._extract_history_text(msg.get("content", ""))
+                if role not in ("user", "assistant") or not content:
+                    continue
+                if role == "user":
+                    current_round = None
+                    content = self._sanitize_retrieval_user_content(content)
+                    if not content or not self._is_natural_retrieval_line(content):
+                        continue
+                    current_round = {
+                        "proactive": self._is_proactive_placeholder(content),
+                        "user": content,
+                        "assistant": [],
+                    }
+                    candidate_rounds.append(current_round)
+                elif self._is_internal_history_noise(role, content):
+                    continue
+                elif (
+                    current_round is not None
+                    and self._is_natural_retrieval_line(content)
+                ):
+                    current_round["assistant"].append(content)
+
+        complete_rounds = [
+            turn for turn in candidate_rounds if turn["assistant"]
+        ]
+        recent_rounds = complete_rounds[-max_rounds:]
+
+        def render_round(turn: dict) -> str:
+            user_line = (
+                proactive_marker
+                if turn["proactive"]
+                else f"用户：{turn['user']}"
+            )
+            assistant_text = "\n".join(turn["assistant"])
+            return f"{user_line}\nAI：{assistant_text}"
+
+        separator = "\n\n" if retrieval_block and recent_rounds else ""
+        history_header = "最近聊天：\n"
+        history_budget = max(
+            0,
+            total_budget - len(retrieval_block) - len(separator),
+        )
+        selected_newest_first = []
+        used_chars = len(history_header)
+        for turn in reversed(recent_rounds):
+            rendered = render_round(turn)
+            added_chars = len(rendered) + (2 if selected_newest_first else 0)
+            if used_chars + added_chars <= history_budget:
+                selected_newest_first.append(rendered)
+                used_chars += added_chars
+                continue
+            if not selected_newest_first and history_budget > len(history_header):
+                available = history_budget - len(history_header)
+                user_line = (
+                    proactive_marker
+                    if turn["proactive"]
+                    else f"用户：{turn['user']}"
+                )
+                assistant_prefix = "\nAI："
+                truncation_marker = "…[前文已截断]"
+                fixed_chars = len(user_line) + len(assistant_prefix)
+                if fixed_chars >= available:
+                    user_budget = max(0, available - len(assistant_prefix))
+                    rendered = user_line[:user_budget] + assistant_prefix
+                else:
+                    assistant_budget = available - fixed_chars
+                    assistant_text = "\n".join(turn["assistant"])
+                    if len(assistant_text) > assistant_budget:
+                        tail_budget = max(
+                            0,
+                            assistant_budget - len(truncation_marker),
+                        )
+                        assistant_text = (
+                            truncation_marker + assistant_text[-tail_budget:]
+                            if tail_budget
+                            else truncation_marker[:assistant_budget]
+                        )
+                    rendered = user_line + assistant_prefix + assistant_text
+                selected_newest_first.append(rendered)
+            break
+
+        history_block = ""
+        if selected_newest_first:
+            history_block = history_header + "\n\n".join(
+                reversed(selected_newest_first)
+            )
+        elif include_history and not retrieval_block:
+            history_block = "延续最近对话"
+
+        query_parts = [part for part in (history_block, retrieval_block) if part]
+        query = "\n\n".join(query_parts) or "延续最近对话"
+        selected_rounds = (
+            recent_rounds[-len(selected_newest_first) :]
+            if selected_newest_first
+            else []
+        )
+        proactive_count = sum(turn["proactive"] for turn in selected_rounds)
+        newest_type = (
+            "proactive" if recent_rounds and recent_rounds[-1]["proactive"] else "normal"
+        ) if recent_rounds else "none"
+        logger.debug(
+            f"[Spark] 主动检索构造: mode={mode}, budget={total_budget}, "
+            f"hint_chars={len(retrieval_text)}, history_budget={history_budget}, "
+            f"candidates={len(complete_rounds)}, selected={len(selected_newest_first)}, "
+            f"normal={len(selected_newest_first) - proactive_count}, "
+            f"proactive={proactive_count}, newest={newest_type}, "
+            f"query_chars={len(query)}, truncated={retrieval_truncated}"
+        )
+        return query
 
     async def _proactive_reply(self, umo: str, tz: Optional[str], prompt_template: str, skip_judge: bool = False) -> bool:
         """
@@ -2409,6 +2604,11 @@ class Spark(Star):
                     umo, prompt, tz, provider=gen_provider, persona=gen_persona
                 )
             else:
+                logger.error(
+                    f"[Spark] Agent Pipeline 不可用，主动对话退回旧路径；"
+                    f"知识库、记忆 hook 与框架上下文裁剪不会生效。"
+                    f"import_error={AGENT_PIPELINE_IMPORT_ERROR}"
+                )
                 response_text = await self._run_legacy_llm(
                     umo, prompt, provider=gen_provider, persona=gen_persona
                 )
@@ -2584,19 +2784,37 @@ class Spark(Star):
             await conv_mgr.update_conversation(umo, conversation_id, history=cleaned)
         return removed
 
-    async def _save_standard_proactive_history(self, umo: str, conversation_id: str, assistant_response: str):
+    async def _save_standard_proactive_history(
+        self,
+        umo: str,
+        conversation_id: str,
+        assistant_response: str,
+        baseline_len: int,
+    ) -> None:
         if not conversation_id or not assistant_response:
             return
-        placeholder = self._get_cfg("proactive_settings", "proactive_user_placeholder") or "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]"
+        placeholder = self._proactive_placeholder()
         conv_mgr = self.context.conversation_manager
-        removed = await self._remove_internal_history_tail(umo, conversation_id, assistant_response=assistant_response)
+        removed = await self._remove_internal_history_tail(
+            umo,
+            conversation_id,
+            before_len=baseline_len,
+            assistant_response=assistant_response,
+        )
         conversation = await conv_mgr.get_conversation(umo, conversation_id)
         history = self._parse_conversation_history(conversation)
 
-        history.append({"role": "user", "content": placeholder})
-        history.append({"role": "assistant", "content": assistant_response})
-        await conv_mgr.update_conversation(umo, conversation_id, history=history)
-        logger.debug(f"[Spark] 已写入标准主动历史: {conversation_id}, cleaned={removed}")
+        expected_tail = [
+            {"role": "user", "content": placeholder},
+            {"role": "assistant", "content": assistant_response},
+        ]
+        if history[-2:] != expected_tail:
+            history.extend(expected_tail)
+            await conv_mgr.update_conversation(umo, conversation_id, history=history)
+        logger.debug(
+            f"[Spark] 已写入标准主动历史: {conversation_id}, "
+            f"baseline={baseline_len}, cleaned={removed}"
+        )
 
     async def _run_agent_pipeline(self, umo: str, prompt: str, tz: Optional[str] = None,
                                    provider=None, persona: str = "") -> Optional[str]:
@@ -2610,9 +2828,10 @@ class Spark(Star):
             message=prompt,
         )
 
-        config = MainAgentBuildConfig(
-            tool_call_timeout=120,
-            llm_safety_mode=False,
+        astrbot_config = self.context.get_config(umo=umo)
+        config = build_main_agent_config(
+            astrbot_config,
+            timezone=tz or astrbot_config.get("timezone"),
             streaming_response=False,
         )
 
@@ -2638,12 +2857,17 @@ class Spark(Star):
         except Exception as e:
             logger.warning(f"[Spark] 获取会话失败: {e}")
 
-        retrieval_contexts = await self._get_conversation_contexts(umo, 10)
+        retrieval_contexts = await self._get_conversation_contexts(
+            umo,
+            10,
+            preserve_round_boundaries=True,
+        )
         retrieval_query = self._build_proactive_retrieval_query(retrieval_contexts, prompt)
         logger.info(f"[Spark] Generation recent contexts for {umo}: {self._format_context_tail_for_log(retrieval_contexts)}")
-        logger.info(f"[Spark] Generation retrieval query for {umo}: {retrieval_query[:500]}")
+        logger.info(f"[Spark] Generation retrieval query for {umo}: {retrieval_query}")
         generation_prompt = prompt
         req.prompt = retrieval_query
+        cron_event.set_extra("spark_proactive_retrieval", True)
 
         result = await build_main_agent(
             event=cron_event,
@@ -2653,17 +2877,6 @@ class Spark(Star):
             req=req,
             apply_reset=False,
         )
-
-        if curr_cid and hook_history_len is not None:
-            try:
-                removed = await self._remove_internal_history_tail(umo, curr_cid, before_len=hook_history_len)
-                if removed:
-                    conversation = await self.context.conversation_manager.get_conversation(umo, curr_cid)
-                    req.conversation = conversation
-                    req.contexts = self._parse_conversation_history(conversation)
-                    logger.debug(f"[Spark] 已回滚主动 hook 临时历史: {curr_cid}, cleaned={removed}")
-            except Exception as e:
-                logger.warning(f"[Spark] 回滚主动 hook 临时历史失败: {e}")
 
         if not result or not result.agent_runner:
             logger.warning(f"[Spark] build_main_agent 返回空结果: {umo}")
@@ -2676,8 +2889,33 @@ class Spark(Star):
         # 与正常 pipeline 顺序一致：OnLLMRequestEvent 触发后各插件注入记忆/知识库/节律等
         if await call_event_hook(cron_event, EventType.OnLLMRequestEvent, req):
             return None
-        # hook 完成后换回 generation_prompt，LLM 收到完整的姿态标签+模板指令
         req.prompt = generation_prompt
+
+        if curr_cid and hook_history_len is not None:
+            try:
+                removed = await self._remove_internal_history_tail(
+                    umo,
+                    curr_cid,
+                    before_len=hook_history_len,
+                )
+                if removed:
+                    conversation = await self.context.conversation_manager.get_conversation(
+                        umo, curr_cid
+                    )
+                    req.conversation = conversation
+                    req.contexts = self._parse_conversation_history(conversation)
+                    logger.debug(
+                        f"[Spark] 已清理本轮 hook 临时历史: {curr_cid}, "
+                        f"baseline={hook_history_len}, cleaned={removed}"
+                    )
+            except Exception as e:
+                logger.warning(f"[Spark] 清理主动 hook 临时历史失败: {e}")
+
+        logger.info(
+            f"[Spark] Main context for {umo}: messages={len(req.contexts)}, "
+            f"max_turns={config.max_context_length}, "
+            f"placeholder={any(self._is_proactive_placeholder(self._extract_history_text(msg.get('content', ''))) for msg in req.contexts if isinstance(msg, dict))}"
+        )
         if result.reset_coro:
             await result.reset_coro
 
@@ -2711,7 +2949,12 @@ class Spark(Star):
                 conv_mgr = self.context.conversation_manager
                 cid = await conv_mgr.get_curr_conversation_id(umo)
             if cid:
-                await self._save_standard_proactive_history(umo, cid, response_text)
+                await self._save_standard_proactive_history(
+                    umo,
+                    cid,
+                    response_text,
+                    hook_history_len or 0,
+                )
             else:
                 logger.warning(f"[Spark] 保存主动回复历史失败: 未找到当前会话ID {umo}")
         except Exception as e:
@@ -2790,6 +3033,11 @@ class Spark(Star):
                     umo, prompt, tz, provider=gen_provider, persona=gen_persona
                 )
             else:
+                logger.error(
+                    f"[Spark] Agent Pipeline 不可用，主动对话退回旧路径；"
+                    f"知识库、记忆 hook 与框架上下文裁剪不会生效。"
+                    f"import_error={AGENT_PIPELINE_IMPORT_ERROR}"
+                )
                 response_text = await self._run_legacy_llm(
                     umo, prompt, provider=gen_provider, persona=gen_persona
                 )
@@ -2924,7 +3172,12 @@ class Spark(Star):
             logger.warning(f"[Spark] Failed to get current persona for {umo}: {e}")
         return ""
 
-    async def _get_conversation_contexts(self, umo: str, rounds: int) -> list:
+    async def _get_conversation_contexts(
+        self,
+        umo: str,
+        rounds: int,
+        preserve_round_boundaries: bool = False,
+    ) -> list:
         """Fetch recent conversation history and Spark proactive projection as context dicts."""
         if rounds <= 0:
             return []
@@ -2938,7 +3191,12 @@ class Spark(Star):
                 if conversation and conversation.history:
                     history = json.loads(conversation.history) if isinstance(conversation.history, str) else conversation.history
                     if isinstance(history, list):
-                        for msg in history[-rounds * 4:]:
+                        source_history = (
+                            history
+                            if preserve_round_boundaries
+                            else history[-rounds * 4:]
+                        )
+                        for msg in source_history:
                             if not isinstance(msg, dict):
                                 continue
                             role = msg.get("role", "")
@@ -2950,6 +3208,8 @@ class Spark(Star):
         except Exception as e:
             logger.warning(f"[Spark] Failed to get conversation contexts for {umo}: {e}")
 
+        if preserve_round_boundaries:
+            return msgs
         msgs = self._dedupe_contexts(msgs)
         return msgs[-rounds * 2:]
 
