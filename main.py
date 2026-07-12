@@ -972,6 +972,18 @@ class Spark(Star):
                     delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
                     st.next_idle_ts = now_ts + delay_m * 60
                     logger.debug(f"[Spark] 沉寂计时刷新(AI回复): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
+            enhancement_enabled = bool(
+                self._get_cfg("enhancement", "enable_enhancement", False)
+            )
+            if not enhancement_enabled:
+                old_task = self._enhancement_tasks.pop(umo, None)
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                self._enhancement_gen[umo] = self._enhancement_gen.get(umo, 0) + 1
+                if st:
+                    st.next_enhancement_ts = 0.0
+                return
+
             # Cancel any pending (sleeping) enhancement task so each LLM turn re-evaluates.
             old_task = self._enhancement_tasks.get(umo)
             if old_task and not old_task.done():
@@ -981,7 +993,17 @@ class Spark(Star):
             self._enhancement_gen[umo] = self._enhancement_gen.get(umo, 0) + 1
 
             if self._should_trigger_enhancement(umo):
-                self._schedule_enhancement(umo)
+                current_user = str(getattr(event, "message_str", "") or "").strip()
+                current_ai = self._extract_history_text(
+                    getattr(_response, "completion_text", "")
+                )
+                current_round = None
+                if current_user and current_ai:
+                    current_round = {
+                        "user": current_user,
+                        "assistant": current_ai,
+                    }
+                self._schedule_enhancement(umo, current_round=current_round)
         except Exception as e:
             logger.debug(f"[Spark] 对话增强检查异常: {e}")
 
@@ -1584,7 +1606,7 @@ class Spark(Star):
             logger.error(f"[Spark] 对话增强判断出错: {e}")
             return False
 
-    def _schedule_enhancement(self, umo: str):
+    def _schedule_enhancement(self, umo: str, current_round: Optional[dict] = None):
         """调度一个延迟的对话增强任务"""
         min_delay = self._get_int_cfg("enhancement", "enhancement_min_delay", 30)
         max_delay = min(self._get_int_cfg("enhancement", "enhancement_max_delay", 1800), 1800)
@@ -1596,14 +1618,22 @@ class Spark(Star):
         
         gen = self._enhancement_gen.get(umo, 0)
         logger.info(f"[Spark] 已调度对话增强: {umo}, {delay}秒后执行")
-        task = asyncio.create_task(self._delayed_enhancement(umo, delay, gen))
+        task = asyncio.create_task(
+            self._delayed_enhancement(umo, delay, gen, current_round=current_round)
+        )
         self._enhancement_tasks[umo] = task
         st = self._states.get(umo)
         if st:
             import time as _time
             st.next_enhancement_ts = _time.time() + delay
 
-    async def _delayed_enhancement(self, umo: str, delay: int, gen: int):
+    async def _delayed_enhancement(
+        self,
+        umo: str,
+        delay: int,
+        gen: int,
+        current_round: Optional[dict] = None,
+    ):
         """延迟执行对话增强回复"""
         try:
             logger.info(f"[Spark] 增强任务开始: {umo}, 等待{delay}秒")
@@ -1667,7 +1697,12 @@ class Spark(Star):
             prompt_template = random.choice(prompts)
             
             logger.info(f"[Spark] 执行对话增强回复: {umo}")
-            ok = await self._proactive_reply(umo, tz, prompt_template)
+            ok = await self._proactive_reply(
+                umo,
+                tz,
+                prompt_template,
+                judge_current_round=current_round,
+            )
             if ok:
                 logger.info(f"[Spark] 对话增强回复成功: {umo}")
             
@@ -2047,7 +2082,12 @@ class Spark(Star):
             except Exception as e:
                 logger.debug(f"[Spark] 刷新 busy_schedule 状态失败: {e}")
 
-    async def _judge_should_reply(self, umo: str, tz: Optional[str]) -> bool:
+    async def _judge_should_reply(
+        self,
+        umo: str,
+        tz: Optional[str],
+        current_round: Optional[dict] = None,
+    ) -> bool:
         """Step 1: Lightweight LLM call to decide whether to send a proactive reply."""
         try:
             await self._refresh_realtime_context()
@@ -2064,9 +2104,68 @@ class Spark(Star):
 
             last_user, last_ai = await self._get_last_messages(umo)
 
-            judge_history_rounds = self._get_cfg("proactive_settings", "judge_history_rounds", 3)
-            judge_contexts = await self._get_conversation_contexts(umo, judge_history_rounds)
-            logger.info(f"[Spark] Judge contexts tail for {umo}: {self._format_context_tail_for_log(judge_contexts, limit=6)}")
+            configured_judge_rounds = self._get_cfg(
+                "proactive_settings", "judge_history_rounds", 3
+            )
+            try:
+                judge_history_rounds = max(0, int(configured_judge_rounds))
+            except (TypeError, ValueError):
+                judge_history_rounds = 3
+            raw_judge_contexts = await self._get_conversation_contexts(
+                umo,
+                judge_history_rounds,
+                preserve_round_boundaries=True,
+            )
+            current_round_source = "official"
+            if current_round:
+                pending_user = self._sanitize_retrieval_user_content(
+                    self._extract_history_text(current_round.get("user", ""))
+                )
+                pending_ai = self._extract_history_text(
+                    current_round.get("assistant", "")
+                )
+                official_rounds = self._project_complete_history_rounds(
+                    raw_judge_contexts
+                )
+                latest_official = official_rounds[-1] if official_rounds else None
+                already_present = bool(
+                    latest_official
+                    and not latest_official["proactive"]
+                    and latest_official["user"] == pending_user
+                    and "\n".join(latest_official["assistant"]) == pending_ai
+                )
+                if pending_user and pending_ai and not already_present:
+                    raw_judge_contexts.extend(
+                        [
+                            {"role": "user", "content": pending_user},
+                            {"role": "assistant", "content": pending_ai},
+                        ]
+                    )
+                    current_round_source = "pending"
+            judge_contexts, selected_judge_rounds = (
+                self._select_recent_round_contexts(
+                    raw_judge_contexts,
+                    judge_history_rounds,
+                )
+            )
+            proactive_rounds = sum(
+                turn["proactive"] for turn in selected_judge_rounds
+            )
+            newest_type = (
+                "proactive"
+                if selected_judge_rounds and selected_judge_rounds[-1]["proactive"]
+                else "normal" if selected_judge_rounds else "none"
+            )
+            logger.info(
+                f"[Spark] Judge contexts for {umo}: "
+                f"configured_rounds={judge_history_rounds}, "
+                f"selected_rounds={len(selected_judge_rounds)}, "
+                f"normal={len(selected_judge_rounds) - proactive_rounds}, "
+                f"proactive={proactive_rounds}, newest={newest_type}, "
+                f"current_round={current_round_source}, "
+                f"messages={len(judge_contexts)}; "
+                f"content={self._format_context_tail_for_log(judge_contexts, limit=len(judge_contexts))}"
+            )
 
             judge_template = self._get_cfg("proactive_settings", "proactive_judge_prompt") or ""
             if not judge_template:
@@ -2077,12 +2176,6 @@ class Spark(Star):
             judge_rules = self._get_cfg("proactive_settings", "proactive_judge_rules") or ""
             if not judge_rules:
                 judge_rules = '！！必须遵守！！：你只能输出一个字："是"或"否"，不允许输出任何其他字。'
-            # Priority hint only — the actual recent conversation is already injected as
-            # structured contexts above; do NOT repeat it as a text block here.
-            judge_priority_hint = (
-                "判断时以上方的最近对话记录、当前时间和当前活动为首要依据；"
-                "长期记忆、知识库或人设里的旧时间线只能作为背景，不能替代最近真实对话。"
-            )
             today_schedule = getattr(self.context, "_busy_schedule_today_schedule", "")
             outfit = getattr(self.context, "_busy_schedule_outfit", "")
             current_activity = getattr(self.context, "_busy_schedule_current_activity", "")
@@ -2139,7 +2232,6 @@ class Spark(Star):
                     llm_resp = await provider.text_chat(
                         prompt=None,
                         contexts=judge_contexts + [
-                            {"role": "user", "content": judge_priority_hint},
                             {"role": "user", "content": judge_prompt},
                             {"role": "user", "content": judge_rules},
                         ],
@@ -2331,6 +2423,54 @@ class Spark(Star):
 
         return "" if self._is_internal_history_noise("user", stripped) else stripped
 
+    def _project_complete_history_rounds(self, contexts: list) -> list[dict]:
+        """Project raw history into complete user/assistant rounds."""
+        candidate_rounds = []
+        current_round = None
+        for msg in contexts:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "")
+            content = self._extract_history_text(msg.get("content", ""))
+            if role not in ("user", "assistant") or not content:
+                continue
+            if role == "user":
+                current_round = None
+                content = self._sanitize_retrieval_user_content(content)
+                if not content or not self._is_natural_retrieval_line(content):
+                    continue
+                current_round = {
+                    "proactive": self._is_proactive_placeholder(content),
+                    "user": content,
+                    "assistant": [],
+                }
+                candidate_rounds.append(current_round)
+            elif self._is_internal_history_noise(role, content):
+                continue
+            elif current_round is not None and self._is_natural_retrieval_line(content):
+                current_round["assistant"].append(content)
+
+        return [turn for turn in candidate_rounds if turn["assistant"]]
+
+    def _select_recent_round_contexts(
+        self, contexts: list, rounds: int
+    ) -> tuple[list, list[dict]]:
+        """Return the newest complete rounds as protocol role messages."""
+        if rounds <= 0:
+            return [], []
+        complete_rounds = self._project_complete_history_rounds(contexts)
+        selected_rounds = complete_rounds[-rounds:]
+        projected = []
+        for turn in selected_rounds:
+            projected.append({"role": "user", "content": turn["user"]})
+            projected.append(
+                {
+                    "role": "assistant",
+                    "content": "\n".join(turn["assistant"]),
+                }
+            )
+        return projected, selected_rounds
+
     def _build_proactive_retrieval_query(self, contexts: list, prompt: str) -> str:
         configured_budget = self._get_cfg(
             "proactive_settings",
@@ -2395,38 +2535,9 @@ class Spark(Star):
             suffix = retrieval_block[-(total_budget - 8) :]
             retrieval_block = "[已截断]" + suffix
 
-        candidate_rounds = []
-        current_round = None
-        if include_history:
-            for msg in contexts:
-                if not isinstance(msg, dict):
-                    continue
-                role = msg.get("role", "")
-                content = self._extract_history_text(msg.get("content", ""))
-                if role not in ("user", "assistant") or not content:
-                    continue
-                if role == "user":
-                    current_round = None
-                    content = self._sanitize_retrieval_user_content(content)
-                    if not content or not self._is_natural_retrieval_line(content):
-                        continue
-                    current_round = {
-                        "proactive": self._is_proactive_placeholder(content),
-                        "user": content,
-                        "assistant": [],
-                    }
-                    candidate_rounds.append(current_round)
-                elif self._is_internal_history_noise(role, content):
-                    continue
-                elif (
-                    current_round is not None
-                    and self._is_natural_retrieval_line(content)
-                ):
-                    current_round["assistant"].append(content)
-
-        complete_rounds = [
-            turn for turn in candidate_rounds if turn["assistant"]
-        ]
+        complete_rounds = (
+            self._project_complete_history_rounds(contexts) if include_history else []
+        )
         recent_rounds = complete_rounds[-max_rounds:]
 
         def render_round(turn: dict) -> str:
@@ -2512,7 +2623,14 @@ class Spark(Star):
         )
         return query
 
-    async def _proactive_reply(self, umo: str, tz: Optional[str], prompt_template: str, skip_judge: bool = False) -> bool:
+    async def _proactive_reply(
+        self,
+        umo: str,
+        tz: Optional[str],
+        prompt_template: str,
+        skip_judge: bool = False,
+        judge_current_round: Optional[dict] = None,
+    ) -> bool:
         """
         执行主动回复的核心方法
         
@@ -2526,7 +2644,11 @@ class Spark(Star):
         try:
             # Step 1: Judge whether to reply (skip for daily greetings etc.)
             if not skip_judge and self._get_cfg("proactive_settings", "proactive_judge_enable", True):
-                if not await self._judge_should_reply(umo, tz):
+                if not await self._judge_should_reply(
+                    umo,
+                    tz,
+                    current_round=judge_current_round,
+                ):
                     return False
 
             # Step 2: Format prompt
