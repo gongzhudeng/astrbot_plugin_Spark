@@ -431,7 +431,6 @@ class Spark(Star):
             basic = self.cfg.get("basic_settings") or {}
             advanced = self.cfg.get("advanced") or {}
             heat = self.cfg.get("heat_settings") or {}
-            enhancement = self.cfg.get("enhancement") or {}
 
             if isinstance(heat, dict):
                 if "heat_window_minutes" not in heat:
@@ -443,10 +442,6 @@ class Spark(Star):
                     changed = True
                 self.cfg["heat_settings"] = heat
 
-            if isinstance(enhancement, dict) and "enhancement_cooldown_minutes" not in enhancement:
-                enhancement["enhancement_cooldown_minutes"] = 12
-                self.cfg["enhancement"] = enhancement
-                changed = True
             if advanced.get("fixed_provider") and not proactive.get("fixed_provider"):
                 proactive["fixed_provider"] = advanced["fixed_provider"]
                 changed = True
@@ -1589,7 +1584,15 @@ class Spark(Star):
                 return False
             
             # Calculate trigger probability
-            base_prob = int(self._get_cfg("enhancement", "enhancement_probability") or 20)
+            base_prob = min(
+                max(
+                    self._get_int_cfg(
+                        "enhancement", "enhancement_probability", 20
+                    ),
+                    0,
+                ),
+                100,
+            )
             st = self._states.get(umo)
             if not st:
                 logger.debug("[Spark] 对话增强跳过: 无 SessionState")
@@ -1664,14 +1667,9 @@ class Spark(Star):
             
             # 执行时检查免打扰（延迟期间可能已进入免打扰时段）
             now = _now_tz(tz)
-            now_ts = now.timestamp()
             latest_chat_ts = max(st.last_user_reply_ts, st.last_ai_reply_ts, st.last_proactive_reply_ts)
             if latest_chat_ts > trigger_chat_ts + 1.0:
                 logger.info(f"[Spark] 增强任务退出: {umo} (等待期间已有新聊天)")
-                return
-            cooldown = max(self._get_int_cfg("enhancement", "enhancement_cooldown_minutes", 12), 0) * 60
-            if cooldown > 0 and latest_chat_ts > 0 and now_ts - latest_chat_ts < cooldown:
-                logger.info(f"[Spark] 增强任务退出: {umo} (距最近聊天不足冷却时间, {int(now_ts - latest_chat_ts)}s < {cooldown}s)")
                 return
             quiet = self._get_cfg("basic_settings", "quiet_hours", "") or ""
             user_quiet = profile.quiet_hours if profile.quiet_hours else quiet
@@ -1713,10 +1711,12 @@ class Spark(Star):
         except Exception as e:
             logger.error(f"[Spark] 对话增强执行出错({umo}): {e}")
         finally:
-            self._enhancement_tasks.pop(umo, None)
-            st = self._states.get(umo)
-            if st:
-                st.next_enhancement_ts = 0.0
+            current_task = asyncio.current_task()
+            if self._enhancement_tasks.get(umo) is current_task:
+                self._enhancement_tasks.pop(umo, None)
+                st = self._states.get(umo)
+                if st:
+                    st.next_enhancement_ts = 0.0
 
     # 调度器
     

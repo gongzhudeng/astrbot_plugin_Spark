@@ -149,12 +149,6 @@
         "type": "int",
         "default": 600
       },
-      "enhancement_cooldown_minutes": {
-        "description": "执行冷却（分钟）",
-        "hint": "增强任务醒来时，如果距最近聊天不足该分钟数，则跳过本次追回复。用于避免刚聊完、刚让对方去处理事情时又追发",
-        "type": "int",
-        "default": 12
-      },
       "enhancement_prompt_templates": {
         "description": "接话提示词模板",
         "hint": "随机选择一个。每个模板会先判断是否有可延续的话题，如果没有再执行对应动作。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
