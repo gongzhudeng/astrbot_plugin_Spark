@@ -630,6 +630,17 @@ class Spark(Star):
             return float(profile.idle_after_minutes)
         return float(self._get_cfg("idle_greetings", "idle_after_minutes", 45) or 45)
 
+    def _calc_fluctuated_idle_delay(
+        self, st: "SessionState", now_ts: float, profile: "UserProfile"
+    ) -> float:
+        """Return the configured idle delay with bounded random fluctuation."""
+        delay_m = self._calc_idle_delay(st, now_ts, profile)
+        fluctuation_m = int(
+            self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15
+        )
+        fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
+        return max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
+
     # 数据持久化
     def _load_user_data(self):
         """加载用户配置和提醒事项（从 user_data.json）"""
@@ -904,10 +915,7 @@ class Spark(Star):
         if is_real_message:
             try:
                 if profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-                    delay_m = self._calc_idle_delay(st, now_ts, profile)
-                    fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
-                    fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
-                    delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
+                    delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
                     st.next_idle_ts = now_ts + delay_m * 60
                     logger.debug(f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
             except Exception as e:
@@ -941,10 +949,7 @@ class Spark(Star):
             event.set_extra(self._heat_event_marker, True)
             profile = self._user_profiles.get(umo)
             if profile and profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-                delay_m = self._calc_idle_delay(st, now_ts, profile)
-                fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
-                fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
-                delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
+                delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
                 st.next_idle_ts = now_ts + delay_m * 60
                 logger.debug(f"[Spark] 沉寂计时刷新(llm_request补偿): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
             await self._debounced_save_session_data()
@@ -966,10 +971,7 @@ class Spark(Star):
                 # Refresh idle greeting timer on every AI response
                 profile = self._user_profiles.get(umo)
                 if profile and profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-                    delay_m = self._calc_idle_delay(st, now_ts, profile)
-                    fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
-                    fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
-                    delay_m = max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
+                    delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
                     st.next_idle_ts = now_ts + delay_m * 60
                     logger.debug(f"[Spark] 沉寂计时刷新(AI回复): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
             enhancement_enabled = bool(
@@ -1879,13 +1881,10 @@ class Spark(Star):
         if not st.next_idle_ts or st.next_idle_ts <= 0:
             profile = self._user_profiles.get(umo)
             if profile and profile.subscribed:
-                delay_m = profile.idle_after_minutes
-                if delay_m is None:
-                    base_delay_m = int(self._get_cfg("idle_greetings", "idle_after_minutes") or 45)
-                    fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
-                    fluctuation_m = min(fluctuation_m, max(0, base_delay_m - 1))
-                    delay_m = max(1, base_delay_m + random.randint(-fluctuation_m, fluctuation_m))
-                
+                delay_m = self._calc_fluctuated_idle_delay(
+                    st, now.timestamp(), profile
+                )
+
                 # Base on last activity time, but never set a timestamp already in the past
                 base_ts = st.last_ts if st.last_ts > 0 else now.timestamp()
                 computed = base_ts + delay_m * 60
