@@ -1916,7 +1916,19 @@ class Spark(Star):
                 await asyncio.sleep(reply_interval)
         else:
             st.consecutive_no_reply_count += 1
-            st.next_idle_ts = 0.0  # judge 拒绝也视为本次任务结束，等下轮沉寂重新计时
+            profile = self._user_profiles.get(umo)
+            if profile and profile.subscribed:
+                retry_now_ts = _now_tz(tz).timestamp()
+                retry_delay_m = self._calc_fluctuated_idle_delay(
+                    st, retry_now_ts, profile
+                )
+                st.next_idle_ts = retry_now_ts + retry_delay_m * 60
+                logger.info(
+                    f"[Spark] 沉寂问候未发送，重新计时: {umo}, "
+                    f"delay={retry_delay_m}m, 将在 {st.next_idle_ts:.0f} 触发"
+                )
+            else:
+                st.next_idle_ts = 0.0
 
     async def _check_daily_greetings(self, umo: str, st: Optional[SessionState], profile: UserProfile,
                                      now: datetime, daily_slots: List[Tuple],
@@ -2222,6 +2234,33 @@ class Spark(Star):
                 judge_persona = await self._get_current_persona_prompt(umo)
             if not judge_persona:
                 judge_persona = "你是一个对话判断助手，只回复是或否"
+
+            latest_dialogue = next(
+                (
+                    msg
+                    for msg in reversed(judge_contexts)
+                    if isinstance(msg, dict)
+                    and msg.get("role") in {"user", "assistant"}
+                    and self._extract_history_text(msg.get("content", ""))
+                ),
+                None,
+            )
+            role_facts = (
+                "角色事实（不可改写）：历史消息中 role=user 的内容均由真实用户 "
+                "Mando 发送；role=assistant 的内容均由你（AI/小怡）发送。"
+                "不得把 AI 说的话归给 Mando，也不得把 Mando 说的话归给 AI。"
+            )
+            if latest_dialogue:
+                latest_role = latest_dialogue.get("role")
+                latest_speaker = "Mando" if latest_role == "user" else "AI/你"
+                latest_content = self._extract_history_text(
+                    latest_dialogue.get("content", "")
+                )
+                role_facts += (
+                    f"本次对话历史的最后一条消息由 {latest_speaker} 发送，"
+                    f"内容是：{latest_content[:500]}"
+                )
+            judge_persona = f"{judge_persona}\n\n{role_facts}"
 
             _JUDGE_RETRIES = 3
             _RETRYABLE = (502, 503, 504)
