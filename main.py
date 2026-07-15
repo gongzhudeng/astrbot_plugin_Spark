@@ -2235,33 +2235,6 @@ class Spark(Star):
             if not judge_persona:
                 judge_persona = "你是一个对话判断助手，只回复是或否"
 
-            latest_dialogue = next(
-                (
-                    msg
-                    for msg in reversed(judge_contexts)
-                    if isinstance(msg, dict)
-                    and msg.get("role") in {"user", "assistant"}
-                    and self._extract_history_text(msg.get("content", ""))
-                ),
-                None,
-            )
-            role_facts = (
-                "角色事实（不可改写）：历史消息中 role=user 的内容均由真实用户 "
-                "Mando 发送；role=assistant 的内容均由你（AI/小怡）发送。"
-                "不得把 AI 说的话归给 Mando，也不得把 Mando 说的话归给 AI。"
-            )
-            if latest_dialogue:
-                latest_role = latest_dialogue.get("role")
-                latest_speaker = "Mando" if latest_role == "user" else "AI/你"
-                latest_content = self._extract_history_text(
-                    latest_dialogue.get("content", "")
-                )
-                role_facts += (
-                    f"本次对话历史的最后一条消息由 {latest_speaker} 发送，"
-                    f"内容是：{latest_content[:500]}"
-                )
-            judge_persona = f"{judge_persona}\n\n{role_facts}"
-
             _JUDGE_RETRIES = 3
             _RETRYABLE = (502, 503, 504)
             last_err = None
