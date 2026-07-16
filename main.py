@@ -16,6 +16,12 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 
 from .core.daily_projection import project_activity_candidates
+from .core.history_content import (
+    build_proactive_user_content,
+    build_user_content_with_datetime,
+    extract_history_text,
+    find_datetime_reminder,
+)
 from .core.time_policy import (
     apply_datetime_policy,
     apply_delay_policy,
@@ -2527,6 +2533,7 @@ class Spark(Star):
                 umo,
                 judge_history_rounds,
                 preserve_round_boundaries=True,
+                include_datetime=True,
             )
             current_round_source = "official"
             if current_round:
@@ -2537,19 +2544,27 @@ class Spark(Star):
                     current_round.get("assistant", "")
                 )
                 official_rounds = self._project_complete_history_rounds(
-                    raw_judge_contexts
+                    raw_judge_contexts,
+                    include_datetime=True,
                 )
                 latest_official = official_rounds[-1] if official_rounds else None
                 already_present = bool(
                     latest_official
                     and not latest_official["proactive"]
-                    and latest_official["user"] == pending_user
+                    and latest_official["semantic_user"] == pending_user
                     and "\n".join(latest_official["assistant"]) == pending_ai
                 )
                 if pending_user and pending_ai and not already_present:
+                    pending_reminder = self._fallback_datetime_reminder(umo, tz)
                     raw_judge_contexts.extend(
                         [
-                            {"role": "user", "content": pending_user},
+                            {
+                                "role": "user",
+                                "content": build_user_content_with_datetime(
+                                    pending_user,
+                                    pending_reminder,
+                                ),
+                            },
                             {"role": "assistant", "content": pending_ai},
                         ]
                     )
@@ -2558,6 +2573,7 @@ class Spark(Star):
                 self._select_recent_round_contexts(
                     raw_judge_contexts,
                     judge_history_rounds,
+                    include_datetime=True,
                 )
             )
             proactive_rounds = sum(
@@ -2781,8 +2797,29 @@ class Spark(Star):
             or "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]"
         )
 
-    def _is_proactive_placeholder(self, content: str) -> bool:
-        normalized = self._normalize_history_text(content)
+    def _fallback_datetime_reminder(
+        self, umo: str, tz: Optional[str] = None
+    ) -> str:
+        astrbot_config = self.context.get_config(umo=umo)
+        provider_settings = astrbot_config.get("provider_settings", {})
+        if not provider_settings.get("datetime_system_prompt"):
+            return ""
+        timezone = tz or astrbot_config.get("timezone")
+        now = _now_tz(timezone)
+        if now.tzinfo is None:
+            now = now.astimezone()
+        current_time = now.strftime("%Y-%m-%d %H:%M (%Z)")
+        return (
+            "<system_reminder>"
+            f"Current datetime: {current_time}"
+            "</system_reminder>"
+        )
+
+    def _is_proactive_placeholder(self, content) -> bool:
+        semantic_content = self._extract_history_text(
+            content, exclude_datetime=True
+        )
+        normalized = self._normalize_history_text(semantic_content)
         known_placeholders = {
             self._normalize_history_text(self._proactive_placeholder()),
             "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]",
@@ -2835,7 +2872,12 @@ class Spark(Star):
 
         return "" if self._is_internal_history_noise("user", stripped) else stripped
 
-    def _project_complete_history_rounds(self, contexts: list) -> list[dict]:
+    def _project_complete_history_rounds(
+        self,
+        contexts: list,
+        *,
+        include_datetime: bool = False,
+    ) -> list[dict]:
         """Project raw history into complete user/assistant rounds."""
         candidate_rounds = []
         current_round = None
@@ -2843,34 +2885,52 @@ class Spark(Star):
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role", "")
-            content = self._extract_history_text(msg.get("content", ""))
-            if role not in ("user", "assistant") or not content:
+            raw_content = msg.get("content", "")
+            semantic_content = self._extract_history_text(
+                raw_content, exclude_datetime=True
+            )
+            if role not in ("user", "assistant") or not semantic_content:
                 continue
             if role == "user":
                 current_round = None
-                content = self._sanitize_retrieval_user_content(content)
-                if not content or not self._is_natural_retrieval_line(content):
+                semantic_content = self._sanitize_retrieval_user_content(
+                    semantic_content
+                )
+                if not semantic_content or not self._is_natural_retrieval_line(
+                    semantic_content
+                ):
                     continue
+                model_content = raw_content if include_datetime else semantic_content
                 current_round = {
-                    "proactive": self._is_proactive_placeholder(content),
-                    "user": content,
+                    "proactive": self._is_proactive_placeholder(raw_content),
+                    "user": model_content,
+                    "semantic_user": semantic_content,
                     "assistant": [],
                 }
                 candidate_rounds.append(current_round)
-            elif self._is_internal_history_noise(role, content):
+            elif self._is_internal_history_noise(role, semantic_content):
                 continue
-            elif current_round is not None and self._is_natural_retrieval_line(content):
-                current_round["assistant"].append(content)
+            elif current_round is not None and self._is_natural_retrieval_line(
+                semantic_content
+            ):
+                current_round["assistant"].append(semantic_content)
 
         return [turn for turn in candidate_rounds if turn["assistant"]]
 
     def _select_recent_round_contexts(
-        self, contexts: list, rounds: int
+        self,
+        contexts: list,
+        rounds: int,
+        *,
+        include_datetime: bool = False,
     ) -> tuple[list, list[dict]]:
         """Return the newest complete rounds as protocol role messages."""
         if rounds <= 0:
             return [], []
-        complete_rounds = self._project_complete_history_rounds(contexts)
+        complete_rounds = self._project_complete_history_rounds(
+            contexts,
+            include_datetime=include_datetime,
+        )
         selected_rounds = complete_rounds[-rounds:]
         projected = []
         for turn in selected_rounds:
@@ -3161,12 +3221,14 @@ class Spark(Star):
                     conv_mgr = self.context.conversation_manager
                     curr_cid = await conv_mgr.get_curr_conversation_id(umo)
                     if curr_cid:
-                        placeholder = self._get_cfg("proactive_settings", "proactive_user_placeholder") or "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]"
+                        reminder = self._fallback_datetime_reminder(umo, tz)
                         await self._add_message_pair_to_history(
                             umo,
                             curr_cid,
                             None,
-                            placeholder,
+                            build_proactive_user_content(
+                                self._proactive_placeholder(), reminder
+                            ),
                             response_text,
                         )
                 except Exception as e:
@@ -3187,30 +3249,15 @@ class Spark(Star):
             logger.error(f"[Spark] proactive error({umo}): {e}", exc_info=True)
             return False
 
-    def _extract_history_text(self, content) -> str:
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, str):
-                    text = part
-                elif isinstance(part, dict):
-                    text = part.get("text") or part.get("content") or part.get("value") or ""
-                else:
-                    text = getattr(part, "text", "") or getattr(part, "content", "") or ""
-                if text:
-                    parts.append(str(text).strip())
-            return " ".join(p for p in parts if p).strip()
-        if isinstance(content, dict):
-            text = content.get("text") or content.get("content") or content.get("value") or ""
-            return str(text).strip() if text else ""
-        text = getattr(content, "text", "") or getattr(content, "content", "") or ""
-        return str(text).strip() if text else ""
+    def _extract_history_text(self, content, *, exclude_datetime: bool = False) -> str:
+        return extract_history_text(content, exclude_datetime=exclude_datetime)
 
-    def _dedupe_contexts(self, contexts: list) -> list:
+    def _dedupe_contexts(
+        self,
+        contexts: list,
+        *,
+        preserve_content: bool = False,
+    ) -> list:
         # Iterate in reverse so the latest occurrence of duplicate content is kept,
         # not the oldest. This matters when proactive placeholders repeat identically.
         seen = set()
@@ -3219,7 +3266,8 @@ class Spark(Star):
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role", "")
-            content = self._extract_history_text(msg.get("content", ""))
+            raw_content = msg.get("content", "")
+            content = self._extract_history_text(raw_content)
             if role not in ("user", "assistant") or not content:
                 continue
             if self._is_internal_history_noise(role, content):
@@ -3228,7 +3276,12 @@ class Spark(Star):
             if key in seen:
                 continue
             seen.add(key)
-            result.append({"role": role, "content": content})
+            result.append(
+                {
+                    "role": role,
+                    "content": raw_content if preserve_content else content,
+                }
+            )
         result.reverse()
         return result
 
@@ -3259,6 +3312,7 @@ class Spark(Star):
             "[灵犀主动",
             "主动对话",
             "[主动对话]",
+            "[主动回复请求",
             "[节律：",
             "Output your last task result below.",
             "正在发送主动消息",
@@ -3324,10 +3378,15 @@ class Spark(Star):
         conversation_id: str,
         assistant_response: str,
         baseline_len: int,
+        datetime_reminder: str = "",
     ) -> None:
         if not conversation_id or not assistant_response:
             return
         placeholder = self._proactive_placeholder()
+        user_content = build_proactive_user_content(
+            placeholder,
+            datetime_reminder,
+        )
         conv_mgr = self.context.conversation_manager
         removed = await self._remove_internal_history_tail(
             umo,
@@ -3339,7 +3398,7 @@ class Spark(Star):
         history = self._parse_conversation_history(conversation)
 
         expected_tail = [
-            {"role": "user", "content": placeholder},
+            {"role": "user", "content": user_content},
             {"role": "assistant", "content": assistant_response},
         ]
         if history[-2:] != expected_tail:
@@ -3411,6 +3470,7 @@ class Spark(Star):
             req=req,
             apply_reset=False,
         )
+        datetime_reminder = find_datetime_reminder(req.extra_user_content_parts)
 
         if not result or not result.agent_runner:
             logger.warning(f"[Spark] build_main_agent 返回空结果: {umo}")
@@ -3448,7 +3508,7 @@ class Spark(Star):
         logger.info(
             f"[Spark] Main context for {umo}: messages={len(req.contexts)}, "
             f"max_turns={config.max_context_length}, "
-            f"placeholder={any(self._is_proactive_placeholder(self._extract_history_text(msg.get('content', ''))) for msg in req.contexts if isinstance(msg, dict))}"
+            f"placeholder={any(self._is_proactive_placeholder(msg.get('content', '')) for msg in req.contexts if isinstance(msg, dict))}"
         )
         if result.reset_coro:
             await result.reset_coro
@@ -3488,6 +3548,7 @@ class Spark(Star):
                     cid,
                     response_text,
                     hook_history_len or 0,
+                    datetime_reminder,
                 )
             else:
                 logger.warning(f"[Spark] 保存主动回复历史失败: 未找到当前会话ID {umo}")
@@ -3510,8 +3571,15 @@ class Spark(Star):
 
         self._last_cron_event_sent = False
 
-        contexts = await self._get_conversation_contexts(umo, 10)
-        logger.info(f"[Spark] Legacy generation recent contexts for {umo}: {self._format_context_tail_for_log(contexts)}")
+        contexts = await self._get_conversation_contexts(
+            umo,
+            10,
+            include_datetime=True,
+        )
+        logger.info(
+            f"[Spark] Legacy generation recent contexts for {umo}: "
+            f"{self._format_context_tail_for_log(contexts)}"
+        )
 
         llm_resp = await provider.text_chat(
             prompt=None,
@@ -3589,12 +3657,14 @@ class Spark(Star):
                     conv_mgr = self.context.conversation_manager
                     curr_cid = await conv_mgr.get_curr_conversation_id(umo)
                     if curr_cid:
-                        placeholder = self._get_cfg("proactive_settings", "proactive_user_placeholder") or "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]"
+                        reminder = self._fallback_datetime_reminder(umo, tz)
                         await self._add_message_pair_to_history(
                             umo,
                             curr_cid,
                             None,
-                            placeholder,
+                            build_proactive_user_content(
+                                self._proactive_placeholder(), reminder
+                            ),
                             response_text,
                         )
                 except Exception as e:
@@ -3613,7 +3683,7 @@ class Spark(Star):
             logger.error(f"[Spark] proactive reminder error({umo}): {e}", exc_info=True)
             return False
 
-    async def _add_message_pair_to_history(self, umo: str, conversation_id: str, conversation, user_prompt: str, assistant_response: str):
+    async def _add_message_pair_to_history(self, umo: str, conversation_id: str, conversation, user_prompt, assistant_response: str):
         """
         将消息对添加到对话历史（使用官方 API）
         
@@ -3629,7 +3699,12 @@ class Spark(Star):
 
             if HAS_NEW_MESSAGE_API:
                 try:
-                    user_msg = UserMessageSegment(content=[TextPart(text=user_prompt)])
+                    user_parts = (
+                        [TextPart(text=part["text"]) for part in user_prompt]
+                        if isinstance(user_prompt, list)
+                        else [TextPart(text=user_prompt)]
+                    )
+                    user_msg = UserMessageSegment(content=user_parts)
                     assistant_msg = AssistantMessageSegment(content=[TextPart(text=assistant_response)])
                     await conv_mgr.add_message_pair(
                         cid=conversation_id,
@@ -3674,7 +3749,13 @@ class Spark(Star):
                 if not isinstance(msg, dict):
                     continue
                 role = msg.get("role", "")
-                content = self._extract_history_text(msg.get("content", ""))[:200]
+                raw_content = msg.get("content", "")
+                content = self._extract_history_text(
+                    raw_content, exclude_datetime=True
+                )
+                if self._is_proactive_placeholder(raw_content):
+                    continue
+                content = content[:200]
                 if self._is_internal_history_noise(role, content):
                     continue
                 if role == "user" and not last_user:
@@ -3711,8 +3792,10 @@ class Spark(Star):
         umo: str,
         rounds: int,
         preserve_round_boundaries: bool = False,
+        *,
+        include_datetime: bool = False,
     ) -> list:
-        """Fetch recent conversation history and Spark proactive projection as context dicts."""
+        """Fetch recent history projected for model context or semantic retrieval."""
         if rounds <= 0:
             return []
 
@@ -3736,7 +3819,15 @@ class Spark(Star):
                             role = msg.get("role", "")
                             if role not in ("user", "assistant"):
                                 continue
-                            content = self._extract_history_text(msg.get("content", ""))
+                            raw_content = msg.get("content", "")
+                            content = (
+                                raw_content
+                                if include_datetime
+                                else self._extract_history_text(
+                                    raw_content,
+                                    exclude_datetime=True,
+                                )
+                            )
                             if content:
                                 msgs.append({"role": role, "content": content})
         except Exception as e:
@@ -3744,7 +3835,10 @@ class Spark(Star):
 
         if preserve_round_boundaries:
             return msgs
-        msgs = self._dedupe_contexts(msgs)
+        msgs = self._dedupe_contexts(
+            msgs,
+            preserve_content=include_datetime,
+        )
         return msgs[-rounds * 2:]
 
     def _apply_segmentation(self, text: str) -> list[str]:
