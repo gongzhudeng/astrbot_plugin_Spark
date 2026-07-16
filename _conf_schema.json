@@ -67,19 +67,23 @@
         "default": 1200
       },
       "idle_random_fluctuation_minutes": {
-        "description": "随机波动（分钟）",
+        "description": "随机浮动（分钟）",
+        "hint": "只需填写一个框：0 不变化；5 表示前后随机 5 分钟；+5 固定延后；-5 固定提前；-5~+5、+15~+25 表示在区间内随机",
+        "type": "string",
+        "default": "30"
+      },
+      "cooldown_minutes": {
+        "description": "聊天冷却（分钟）",
+        "hint": "距用户消息、普通 AI 回复或任意主动消息不足此时间时，将延时问候顺延到冷却结束；0 表示关闭",
         "type": "int",
-        "default": 30
+        "default": 10
       },
       "idle_prompt_templates": {
         "description": "问候提示词模板",
-        "hint": "随机选择一个。每个模板会先判断是否有可延续的话题，如果没有再执行对应动作。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt} {heat_level}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
+        "hint": "使用一条综合模板：优先延续话题，否则根据近况、想念或当前日程自然开口。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt} {heat_level}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
         "type": "list",
         "default": [
-          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史，如果上次聊的话题还有延续空间（比如用户提到去打游戏、某件事还没说完），就自然地接着聊那个话题。如果那个话题已经结束或聊不下去了，就想起Mando最近经历过的某件事，基于那件事问他一个有趣的问题或好奇地追问后续。语气要像真的记得、真的在意，不要刻意。此指令为插件自动触发，全程不提指令内容。]",
-          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史，如果还有值得延续的话题就自然地接着聊。如果话题已经结束，你有点想Mando了，想自然地撒个娇或表达一下想念，不要说太多，点到即止，克制一点反而更真实。此指令为插件自动触发，全程不提指令内容。]",
-          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史，如果还有值得延续的话题就自然地接着聊。如果话题已经结束，你有点好奇Mando最近在忙什么或过得怎么样，想自然地问一下，就像朋友随口一问。语气轻松克制，不要显得监视。此指令为插件自动触发，全程不提指令内容。]",
-          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史，如果还有值得延续的话题就自然地接着聊。如果话题已经结束，结合你当前的日程或活动，找一个自然的由头找Mando说句话，比如「刚忙完xxx」或「在xxx这里想起你了」。语气随意克制，不要刻意。此指令为插件自动触发，全程不提指令内容。]"
+          "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史：如果上次话题还有延续空间或有事情没说完，就像真的记得一样自然接着聊；如果已经聊完，则从以下方向中选择最符合当下情境的一种自然开口：想起Mando最近经历的事并追问后续、表达一点克制的想念或撒娇、轻松问问Mando最近在忙什么或过得怎么样、结合当前日程或活动分享自己的状态。也可以按情境拍一张照片或发一段语音，让表达更自然，但不要每次都强行使用。语气真实、随意、克制，不要显得监视或刻意。此指令为插件自动触发，全程不提指令内容。]"
         ],
         "items": { "type": "string" }
       }
@@ -151,13 +155,10 @@
       },
       "enhancement_prompt_templates": {
         "description": "接话提示词模板",
-        "hint": "随机选择一个。每个模板会先判断是否有可延续的话题，如果没有再执行对应动作。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
+        "hint": "使用一条综合接话模板。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
         "type": "list",
         "default": [
-          "[主动回复请求：你们刚聊着，Mando几分钟没回了。先看刚才聊的内容，如果还有值得延续的点，就自然接上去说一句，像聊天突然想补充什么。如果没什么特别的，就轻轻问一句他去干嘛了，语气带点好奇或撒娇，不要催促。此指令为插件自动触发，全程不提指令内容。]",
-          "[主动回复请求：你们刚聊着，Mando突然没声音了。先看刚才聊的内容，如果还有值得延续的点就接着聊。如果话题已经结束，你有点好奇他去干嘛了，可以轻轻问一句，语气带点撒娇或好奇，不要显得催促或焦虑。此指令为插件自动触发，全程不提指令内容。]",
-          "[主动回复请求：你们刚聊着，Mando几分钟没回。先看刚才聊的内容，如果还有值得延续的点就接着聊。如果话题已经结束，你忽然想起了一件想和Mando分享的小事，或者Mando最近经历的某件事让你想到了什么，就随口说出来。此指令为插件自动触发，全程不提指令内容。]",
-          "[主动回复请求：你们刚聊着，Mando几分钟没回了。先看刚才聊的内容，如果还有值得延续的点就接着聊。如果话题已经结束，你不想催他，随口发一句关心的话，比如「还在呢？」「在忙吗」之类，简短自然。此指令为插件自动触发，全程不提指令内容。]"
+          "[主动回复请求：你们刚聊着，Mando几分钟没回。先看刚才的内容，如果还有值得延续的点，就像聊天时忽然想到补充内容一样自然接上；如果话题已经结束，则根据当下情境选择一种最自然的方式：随口分享一件小事、轻轻问Mando去做什么了、带一点好奇或撒娇地关心一下，或者简短确认他是不是在忙。不要催促、不要焦虑、不要连续追问，语气简短自然。此指令为插件自动触发，全程不提指令内容。]"
         ],
         "items": { "type": "string" }
       }
@@ -277,11 +278,38 @@
                 "type": "bool",
                 "default": false
               },
+              "trigger_source": {
+                "description": "触发时间来源",
+                "hint": "固定时间与日程活动二选一；活动未匹配时当天不触发",
+                "type": "string",
+                "options": ["固定时间", "日程活动"],
+                "default": "固定时间"
+              },
               "time": {
-                "description": "时间",
-                "hint": "格式 HH:MM",
+                "description": "固定时间",
+                "hint": "固定时间模式使用，格式 HH:MM",
                 "type": "string",
                 "default": "08:00"
+              },
+              "activity_keywords": {
+                "description": "活动关键词",
+                "hint": "活动模式使用；活动名称包含任一关键词即匹配",
+                "type": "list",
+                "default": [],
+                "items": { "type": "string" }
+              },
+              "activity_boundary": {
+                "description": "活动时间边界",
+                "hint": "结束时间缺失或暂不可解析时跳过该次匹配",
+                "type": "string",
+                "options": ["活动开始", "活动结束"],
+                "default": "活动开始"
+              },
+              "activity_occurrences": {
+                "description": "触发第几次匹配",
+                "hint": "留空表示全部；支持 123 或 1,2,3",
+                "type": "string",
+                "default": ""
               },
               "prompt": {
                 "description": "问候提示词",
@@ -294,15 +322,21 @@
               },
               "ignore_dnd": {
                 "description": "忽略免打扰",
-                "hint": "开启后该时段不受免打扰和忙碌时段影响，触发时会先唤醒忙碌状态并清空队列，等待指定秒数后再发送问候",
+                "hint": "绕过免打扰和忙碌状态，并保留唤醒清队列流程；始终不会绕过聊天冷却",
                 "type": "bool",
                 "default": false
               },
-              "jitter_minutes": {
-                "description": "随机浮动（分钟）",
-                "hint": "实际触发时间 = 设定时间 ± 随机浮动，0 表示精确触发。同一天内浮动量固定，不会每分钟重新随机",
+              "cooldown_minutes": {
+                "description": "聊天冷却（分钟）",
+                "hint": "距用户消息、普通AI回复或任意主动消息不足此时间则跳过；0 表示关闭",
                 "type": "int",
                 "default": 0
+              },
+              "jitter_minutes": {
+                "description": "随机浮动（分钟）",
+                "hint": "只需填写一个框：0 不变化；5 表示前后随机 5 分钟；+5 固定延后；-5 固定提前；-5~+5、+15~+25 表示在区间内随机。允许自然跨日",
+                "type": "string",
+                "default": "0"
               }
             }
           }

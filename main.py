@@ -8,12 +8,21 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
+
+from .core.time_policy import (
+    apply_datetime_policy,
+    apply_delay_policy,
+    cooldown_deadline,
+    migrate_compact_policy_values,
+    parse_occurrences,
+    parse_policy,
+)
 
 # 尝试导入 StarTools（如果可用）
 try:
@@ -213,6 +222,7 @@ class SessionState:
     last_user_reply_ts: float = 0.0
     consecutive_no_reply_count: int = 0
     next_idle_ts: float = 0.0
+    idle_retry_after_ts: float = 0.0
     last_proactive_reply_ts: float = 0.0  # 最近一次主动回复时间戳
     last_ai_reply_ts: float = 0.0  # 最近一次 AI 普通回复时间戳（用于对话增强取消判断）
     msg_timestamps: list = None  # rolling window of user message timestamps for heat computation
@@ -239,6 +249,7 @@ class SessionState:
             "last_user_reply_ts": self.last_user_reply_ts,
             "consecutive_no_reply_count": self.consecutive_no_reply_count,
             "next_idle_ts": self.next_idle_ts,
+            "idle_retry_after_ts": self.idle_retry_after_ts,
             "last_proactive_reply_ts": self.last_proactive_reply_ts,
             "last_ai_reply_ts": self.last_ai_reply_ts,
             "msg_timestamps": self.msg_timestamps if self.msg_timestamps else [],
@@ -261,6 +272,7 @@ class SessionState:
             last_user_reply_ts=data.get("last_user_reply_ts", 0.0),
             consecutive_no_reply_count=data.get("consecutive_no_reply_count", 0),
             next_idle_ts=data.get("next_idle_ts", 0.0),
+            idle_retry_after_ts=data.get("idle_retry_after_ts", 0.0),
             last_proactive_reply_ts=data.get("last_proactive_reply_ts", 0.0),
             last_ai_reply_ts=data.get("last_ai_reply_ts", 0.0),
             msg_timestamps=msg_ts,
@@ -286,6 +298,16 @@ class SessionState:
         expired_tags = [t for t, ts in self.last_fired_tags.items() if now_ts - ts > 7 * 86400]
         for t in expired_tags:
             del self.last_fired_tags[t]
+
+
+@dataclass(frozen=True)
+class DailyGreetingTask:
+    slot_num: int
+    target: datetime
+    tag: str
+    prompt: object
+    ignore_dnd: bool
+    cooldown_minutes: int
 
 
 @dataclass
@@ -379,6 +401,15 @@ class Spark(Star):
         self._sync_subscribed_users_from_config()
         self._migrate_config()
         self._migrate_daily_greetings()
+        self._migrate_compact_time_policy_values()
+
+    def _migrate_compact_time_policy_values(self):
+        try:
+            if migrate_compact_policy_values(self.cfg):
+                self.cfg.save_config()
+                logger.info("[Spark] 已迁移旧整数时间浮动配置为单框字符串格式")
+        except Exception as e:
+            logger.warning(f"[Spark] 时间浮动配置迁移失败: {e}")
 
     def _migrate_daily_greetings(self):
         """一次性迁移：旧的 daily1/2/3 扁平配置 -> 新的 daily_greetings 列表格式"""
@@ -627,14 +658,51 @@ class Spark(Star):
 
     def _calc_fluctuated_idle_delay(
         self, st: "SessionState", now_ts: float, profile: "UserProfile"
-    ) -> float:
-        """Return the configured idle delay with bounded random fluctuation."""
+    ) -> float | None:
+        """Apply the configured time policy to the heat/fixed idle baseline."""
         delay_m = self._calc_idle_delay(st, now_ts, profile)
-        fluctuation_m = int(
-            self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15
+        idle_cfg = self.cfg.get("idle_greetings") or {}
+        if not isinstance(idle_cfg, dict):
+            idle_cfg = {}
+        policy_config = idle_cfg
+        compact_value = idle_cfg.get("idle_random_fluctuation_minutes", 15)
+        if (
+            idle_cfg.get("offset_mode") in (None, "")
+            and str(compact_value).strip().isdigit()
+        ):
+            policy_config = dict(idle_cfg)
+            legacy_fluctuation = max(0, int(compact_value or 0))
+            policy_config["idle_random_fluctuation_minutes"] = min(
+                legacy_fluctuation,
+                max(0, int(delay_m) - 1),
+            )
+        policy = parse_policy(
+            policy_config,
+            legacy_jitter_key="idle_random_fluctuation_minutes",
         )
-        fluctuation_m = min(fluctuation_m, max(0, int(delay_m) - 1))
-        return max(1, delay_m + random.randint(-fluctuation_m, fluctuation_m))
+        result = apply_delay_policy(
+            delay_m,
+            policy,
+            seed=f"idle:{now_ts:.0f}:{len(st.msg_timestamps or [])}",
+        )
+        if result.is_valid:
+            st.idle_retry_after_ts = 0.0
+            return result.minutes
+        if result.retryable:
+            retry_minutes = max(
+                1,
+                int(idle_cfg.get("offset_retry_minutes", 1) or 1),
+            )
+            st.idle_retry_after_ts = now_ts + retry_minutes * 60
+            logger.info(
+                f"[Spark] 延时问候随机偏移结果无效，{retry_minutes} 分钟后重算"
+            )
+        else:
+            st.idle_retry_after_ts = -1.0
+            logger.warning(
+                "[Spark] 延时问候固定偏移结果小于等于 0，本轮不安排"
+            )
+        return None
 
     # 数据持久化
     def _load_user_data(self):
@@ -908,11 +976,13 @@ class Spark(Star):
 
         # 计算下一次延时问候触发时间（仅真实聊天消息触发，命令不重置倒计时）
         if is_real_message:
+            st.idle_retry_after_ts = 0.0
             try:
                 if profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
                     delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
-                    st.next_idle_ts = now_ts + delay_m * 60
-                    logger.debug(f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
+                    st.next_idle_ts = now_ts + delay_m * 60 if delay_m else 0.0
+                    if delay_m:
+                        logger.debug(f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
             except Exception as e:
                 logger.warning(f"[Spark] 计算 next_idle_ts 失败: {e}")
 
@@ -945,8 +1015,9 @@ class Spark(Star):
             profile = self._user_profiles.get(umo)
             if profile and profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
                 delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
-                st.next_idle_ts = now_ts + delay_m * 60
-                logger.debug(f"[Spark] 沉寂计时刷新(llm_request补偿): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
+                st.next_idle_ts = now_ts + delay_m * 60 if delay_m else 0.0
+                if delay_m:
+                    logger.debug(f"[Spark] 沉寂计时刷新(llm_request补偿): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
             await self._debounced_save_session_data()
         except Exception as e:
             logger.debug(f"[Spark] _on_llm_request_update_ts 异常: {e}")
@@ -967,8 +1038,9 @@ class Spark(Star):
                 profile = self._user_profiles.get(umo)
                 if profile and profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
                     delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
-                    st.next_idle_ts = now_ts + delay_m * 60
-                    logger.debug(f"[Spark] 沉寂计时刷新(AI回复): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
+                    st.next_idle_ts = now_ts + delay_m * 60 if delay_m else 0.0
+                    if delay_m:
+                        logger.debug(f"[Spark] 沉寂计时刷新(AI回复): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}")
             enhancement_enabled = bool(
                 self._get_cfg("enhancement", "enable_enhancement", False)
             )
@@ -1805,66 +1877,151 @@ class Spark(Star):
         # 调度器结束时使用去抖保存，减少磁盘I/O
         await self._debounced_save_session_data()
 
-    def _parse_daily_slots(self, now: datetime) -> List[Tuple[int, Optional[Tuple[int, int]], str, dict]]:
-        """
-        Parse daily greetings config. Supports:
-        1. New list format: daily_greetings = [{enable, time, prompt, ignore_dnd}, ...]
-        2. Legacy slot format: slot1/slot2/slot3 or daily1_enable/time1/prompt1
-        Returns: [(slot_num, time_tuple, tag, slot_cfg), ...]
-        """
-        daily = self.cfg.get("daily_prompts") or {}
-        slots_info = []
+    def _coerce_schedule_datetime(self, value: object, now: datetime) -> datetime | None:
+        if not isinstance(value, datetime):
+            return None
+        if now.tzinfo and value.tzinfo is None:
+            return value.replace(tzinfo=now.tzinfo)
+        if not now.tzinfo and value.tzinfo:
+            return value.replace(tzinfo=None)
+        return value
 
-        # New list format takes priority
-        greetings_list = daily.get("daily_greetings", [])
-        if isinstance(greetings_list, list) and greetings_list:
-            for idx, item in enumerate(greetings_list):
+    def _daily_task(
+        self,
+        *,
+        slot_num: int,
+        source_date: date,
+        base: datetime,
+        item: dict,
+        occurrence: int = 0,
+    ) -> DailyGreetingTask:
+        policy = parse_policy(item, legacy_jitter_key="jitter_minutes")
+        seed = f"daily:{source_date.isoformat()}:{slot_num}:{occurrence}"
+        target = apply_datetime_policy(base, policy, seed=seed)
+        tag = (
+            f"daily_{slot_num}_{occurrence}@{source_date.isoformat()}"
+            f"->{target.strftime('%Y-%m-%d %H:%M')}"
+        )
+        return DailyGreetingTask(
+            slot_num=slot_num,
+            target=target,
+            tag=tag,
+            prompt=item.get("prompt", ""),
+            ignore_dnd=bool(item.get("ignore_dnd", False)),
+            cooldown_minutes=max(0, int(item.get("cooldown_minutes", 0) or 0)),
+        )
+
+    def _activity_daily_tasks(
+        self, slot_num: int, item: dict, source_date: date, now: datetime
+    ) -> list[DailyGreetingTask]:
+        get_timeline = getattr(self.context, "_busy_schedule_get_timeline", None)
+        if not callable(get_timeline):
+            return []
+        keywords = [
+            str(keyword).strip()
+            for keyword in item.get("activity_keywords", [])
+            if str(keyword).strip()
+        ]
+        if not keywords:
+            return []
+        try:
+            timeline = get_timeline(source_date)
+        except Exception as exc:
+            logger.warning(f"[Spark] 获取结构化日程失败({source_date}): {exc}")
+            return []
+
+        matches = [
+            activity
+            for activity in timeline
+            if any(keyword in str(activity.get("activity", "")) for keyword in keywords)
+        ]
+        selected = parse_occurrences(item.get("activity_occurrences"))
+        boundary_value = str(
+            item.get("activity_boundary", "活动开始") or "活动开始"
+        )
+        boundary = "end" if boundary_value in {"end", "活动结束"} else "start"
+        tasks = []
+        for occurrence, activity in enumerate(matches, start=1):
+            if selected is not None and occurrence not in selected:
+                continue
+            if not activity.get("valid", True):
+                logger.warning(
+                    f"[Spark] 跳过无效日程活动: {activity.get('activity', '')} "
+                    f"({activity.get('error', 'unknown error')})"
+                )
+                continue
+            base = self._coerce_schedule_datetime(activity.get(boundary), now)
+            if base is None:
+                logger.warning(
+                    f"[Spark] 跳过缺少{boundary}边界的活动: "
+                    f"{activity.get('activity', '')}"
+                )
+                continue
+            tasks.append(
+                self._daily_task(
+                    slot_num=slot_num,
+                    source_date=source_date,
+                    base=base,
+                    item=item,
+                    occurrence=occurrence,
+                )
+            )
+        return tasks
+
+    def _parse_daily_slots(self, now: datetime) -> list[DailyGreetingTask]:
+        """Project fixed-time and schedule-driven greetings onto concrete datetimes."""
+        daily = self.cfg.get("daily_prompts") or {}
+        greetings = daily.get("daily_greetings", [])
+        tasks: list[DailyGreetingTask] = []
+        source_dates = [now.date() - timedelta(days=1), now.date(), now.date() + timedelta(days=1)]
+
+        if isinstance(greetings, list) and greetings:
+            for idx, item in enumerate(greetings):
                 if not isinstance(item, dict) or not item.get("enable", False):
                     continue
-                time_str = item.get("time", "")
-                prompt_str = item.get("prompt", "")
-                ignore_dnd = item.get("ignore_dnd", False)
-                jitter_minutes = max(0, int(item.get("jitter_minutes", 0) or 0))
-                time_tuple = _parse_hhmm(time_str)
-                if time_tuple:
-                    if jitter_minutes > 0:
-                        # Stable per-day offset: same seed → same offset every minute of the day
-                        _rng = random.Random(now.toordinal() * 1000 + idx)
-                        offset = _rng.randint(-jitter_minutes, jitter_minutes)
-                        total = max(0, min(time_tuple[0] * 60 + time_tuple[1] + offset, 23 * 60 + 59))
-                        actual_time = (total // 60, total % 60)
-                    else:
-                        actual_time = time_tuple
-                    tag = f"daily_{idx}@{now.strftime('%Y-%m-%d')} {actual_time[0]:02d}:{actual_time[1]:02d}"
-                    slots_info.append((idx, actual_time, tag, {
-                        "prompt": prompt_str, "ignore_dnd": ignore_dnd,
-                    }))
-            return slots_info
+                if item.get("trigger_source", "固定时间") in {
+                    "activity",
+                    "日程活动",
+                }:
+                    for source_date in source_dates:
+                        tasks.extend(
+                            self._activity_daily_tasks(idx, item, source_date, now)
+                        )
+                    continue
+                parsed = _parse_hhmm(str(item.get("time", "")))
+                if not parsed:
+                    continue
+                for source_date in source_dates:
+                    base = datetime.combine(source_date, time(*parsed), tzinfo=now.tzinfo)
+                    tasks.append(
+                        self._daily_task(
+                            slot_num=idx,
+                            source_date=source_date,
+                            base=base,
+                            item=item,
+                        )
+                    )
+            return tasks
 
-        # Legacy slot format (slot1/slot2/slot3)
         for slot_num in [1, 2, 3]:
             slot_cfg = daily.get(f"slot{slot_num}", {})
-            if slot_cfg:
-                if slot_cfg.get("enable", False):
-                    time_str = slot_cfg.get("time", "")
-                    prompt_str = slot_cfg.get("prompt", "")
-                    time_tuple = _parse_hhmm(time_str)
-                    if time_tuple:
-                        tag = f"daily{slot_num}@{now.strftime('%Y-%m-%d')} {time_tuple[0]:02d}:{time_tuple[1]:02d}"
-                        slots_info.append((slot_num, time_tuple, tag, {"prompt": prompt_str}))
-            else:
-                enable_key = f"daily{slot_num}_enable"
-                time_key = f"time{slot_num}"
-                prompt_key = f"prompt{slot_num}"
-                if daily.get(enable_key, False):
-                    time_str = daily.get(time_key, "")
-                    prompt_str = daily.get(prompt_key, "")
-                    time_tuple = _parse_hhmm(time_str)
-                    if time_tuple:
-                        tag = f"daily{slot_num}@{now.strftime('%Y-%m-%d')} {time_tuple[0]:02d}:{time_tuple[1]:02d}"
-                        slots_info.append((slot_num, time_tuple, tag, {"prompt": prompt_str}))
-
-        return slots_info
+            enabled = bool(slot_cfg.get("enable", False)) if slot_cfg else bool(daily.get(f"daily{slot_num}_enable", False))
+            time_str = slot_cfg.get("time", "") if slot_cfg else daily.get(f"time{slot_num}", "")
+            prompt = slot_cfg.get("prompt", "") if slot_cfg else daily.get(f"prompt{slot_num}", "")
+            parsed = _parse_hhmm(str(time_str))
+            if not enabled or not parsed:
+                continue
+            for source_date in source_dates:
+                base = datetime.combine(source_date, time(*parsed), tzinfo=now.tzinfo)
+                tasks.append(
+                    self._daily_task(
+                        slot_num=slot_num,
+                        source_date=source_date,
+                        base=base,
+                        item={"prompt": prompt},
+                    )
+                )
+        return tasks
 
     async def _check_idle_greeting(self, umo: str, st: Optional[SessionState], now: datetime, 
                                    tz: Optional[str], reply_interval: int):
@@ -1879,11 +2036,18 @@ class Spark(Star):
         
         # 向后兼容：如果 next_idle_ts 未设置或为0，自动初始化
         if not st.next_idle_ts or st.next_idle_ts <= 0:
+            if st.idle_retry_after_ts < 0:
+                return
+            if st.idle_retry_after_ts and now.timestamp() < st.idle_retry_after_ts:
+                return
             profile = self._user_profiles.get(umo)
             if profile and profile.subscribed:
                 delay_m = self._calc_fluctuated_idle_delay(
                     st, now.timestamp(), profile
                 )
+                if not delay_m:
+                    await self._debounced_save_session_data()
+                    return
 
                 # Base on last activity time, but never set a timestamp already in the past
                 base_ts = st.last_ts if st.last_ts > 0 else now.timestamp()
@@ -1894,6 +2058,25 @@ class Spark(Star):
                 return  # 本次不触发，等下次检查
         
         if now.timestamp() < st.next_idle_ts:
+            return
+
+        cooldown_minutes = max(
+            0,
+            int(self._get_cfg("idle_greetings", "cooldown_minutes", 10) or 0),
+        )
+        latest_activity_ts = max(
+            st.last_user_reply_ts,
+            st.last_ai_reply_ts,
+            st.last_proactive_reply_ts,
+        )
+        cooldown_until = cooldown_deadline(latest_activity_ts, cooldown_minutes)
+        if now.timestamp() < cooldown_until:
+            st.next_idle_ts = cooldown_until
+            logger.info(
+                f"[Spark] 延时问候顺延: {umo} "
+                f"(聊天冷却 {cooldown_minutes} 分钟，顺延至 {cooldown_until:.0f})"
+            )
+            await self._debounced_save_session_data()
             return
         
         tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
@@ -1922,61 +2105,101 @@ class Spark(Star):
                 retry_delay_m = self._calc_fluctuated_idle_delay(
                     st, retry_now_ts, profile
                 )
-                st.next_idle_ts = retry_now_ts + retry_delay_m * 60
-                logger.info(
-                    f"[Spark] 沉寂问候未发送，重新计时: {umo}, "
-                    f"delay={retry_delay_m}m, 将在 {st.next_idle_ts:.0f} 触发"
-                )
+                if retry_delay_m:
+                    st.next_idle_ts = retry_now_ts + retry_delay_m * 60
+                    logger.info(
+                        f"[Spark] 沉寂问候未发送，重新计时: {umo}, "
+                        f"delay={retry_delay_m}m, 将在 {st.next_idle_ts:.0f} 触发"
+                    )
+                else:
+                    st.next_idle_ts = 0.0
             else:
                 st.next_idle_ts = 0.0
 
-    async def _check_daily_greetings(self, umo: str, st: Optional[SessionState], profile: UserProfile,
-                                     now: datetime, daily_slots: List[Tuple],
-                                     tz: Optional[str], reply_interval: int,
-                                     is_in_dnd: bool = False, is_busy: bool = False):
-        """检查并触发每日定时问候（支持 ignore_dnd 跳过免打扰/忙碌）"""
+    async def _check_daily_greetings(
+        self,
+        umo: str,
+        st: Optional[SessionState],
+        profile: UserProfile,
+        now: datetime,
+        daily_slots: list[DailyGreetingTask],
+        tz: Optional[str],
+        reply_interval: int,
+        is_in_dnd: bool = False,
+        is_busy: bool = False,
+    ):
+        """Trigger due daily greetings after cooldown and DND gates."""
         if not bool(self.cfg.get("enable_daily_greetings", True)) or not profile.daily_reminders_enabled:
             return
-        
         if not st:
             return
-        
-        for slot_num, slot_time, tag, slot_cfg in daily_slots:
-            if slot_time and now.hour == slot_time[0] and now.minute == slot_time[1]:
-                if st.has_fired(tag):
-                    continue
-                
-                # ignore_dnd=true 的时段不受免打扰/忙碌限制
-                if not slot_cfg.get("ignore_dnd", False):
-                    if is_in_dnd or is_busy:
-                        continue
 
-                _prompt_raw = slot_cfg.get("prompt", "")
-                if isinstance(_prompt_raw, list):
-                    import random as _random
-                    prompt_template = _random.choice(_prompt_raw) if _prompt_raw else ""
-                else:
-                    prompt_template = _prompt_raw
-                if prompt_template:
-                    logger.info(f"[Spark] 触发每日定时{slot_num}回复 {umo} (ignore_dnd={slot_cfg.get('ignore_dnd', False)})")
-                    # When ignore_dnd overrides busy state: wake AI, flush queued messages first
-                    if slot_cfg.get("ignore_dnd", False) and is_busy:
-                        flush_delay = int(self._get_cfg("daily_prompts", "ignore_busy_flush_delay_seconds") or 10)
-                        wake_fn = getattr(self.context, "_busy_schedule_wake_and_flush", None)
-                        if wake_fn:
-                            try:
-                                await wake_fn(umo)
-                            except Exception as e:
-                                logger.warning(f"[Spark] wake_and_flush 失败: {e}")
-                        await asyncio.sleep(flush_delay)
-                    ok = await self._proactive_reply(umo, tz, prompt_template, skip_judge=True)
-                    if ok:
-                        st.mark_fired(tag)
-                        if reply_interval > 0:
-                            await asyncio.sleep(reply_interval)
-                    else:
-                        st.consecutive_no_reply_count += 1
-                break  # 同一分钟只触发一个定时任务
+        due_tasks = [
+            task
+            for task in daily_slots
+            if task.target.strftime("%Y-%m-%d %H:%M")
+            == now.strftime("%Y-%m-%d %H:%M")
+        ]
+        for task in due_tasks:
+            if st.has_fired(task.tag):
+                continue
+
+            latest_chat_ts = max(
+                st.last_user_reply_ts,
+                st.last_ai_reply_ts,
+                st.last_proactive_reply_ts,
+            )
+            if (
+                task.cooldown_minutes > 0
+                and latest_chat_ts > 0
+                and now.timestamp() - latest_chat_ts < task.cooldown_minutes * 60
+            ):
+                logger.info(
+                    f"[Spark] 每日问候跳过: {umo} "
+                    f"(聊天冷却 {task.cooldown_minutes} 分钟)"
+                )
+                st.mark_fired(task.tag)
+                continue
+
+            if not task.ignore_dnd and (is_in_dnd or is_busy):
+                continue
+
+            prompt_raw = task.prompt
+            prompt_template = (
+                random.choice(prompt_raw) if isinstance(prompt_raw, list) and prompt_raw else prompt_raw
+            )
+            if not prompt_template:
+                continue
+
+            logger.info(
+                f"[Spark] 触发每日定时{task.slot_num}回复 {umo} "
+                f"(ignore_dnd={task.ignore_dnd})"
+            )
+            if task.ignore_dnd and is_busy:
+                flush_delay = int(
+                    self._get_cfg(
+                        "daily_prompts", "ignore_busy_flush_delay_seconds"
+                    )
+                    or 10
+                )
+                wake_fn = getattr(
+                    self.context, "_busy_schedule_wake_and_flush", None
+                )
+                if wake_fn:
+                    try:
+                        await wake_fn(umo)
+                    except Exception as exc:
+                        logger.warning(f"[Spark] wake_and_flush 失败: {exc}")
+                await asyncio.sleep(flush_delay)
+            ok = await self._proactive_reply(
+                umo, tz, prompt_template, skip_judge=True
+            )
+            if ok:
+                st.mark_fired(task.tag)
+                if reply_interval > 0:
+                    await asyncio.sleep(reply_interval)
+            else:
+                st.consecutive_no_reply_count += 1
 
     async def _should_auto_unsubscribe(self, umo: str, profile: UserProfile, st: SessionState, now: datetime) -> bool:
         """检查是否需要自动退订（根据用户无回复天数）"""
