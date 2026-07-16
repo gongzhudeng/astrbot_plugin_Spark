@@ -15,6 +15,7 @@ from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 
+from .core.daily_projection import project_activity_candidates
 from .core.time_policy import (
     apply_datetime_policy,
     apply_delay_policy,
@@ -219,6 +220,7 @@ class SessionState:
     last_ts: float = 0.0
     last_fired_tag: str = ""  # 保留用于向后兼容
     last_fired_tags: dict = None  # 改为字典：{tag: timestamp}，支持过期清理
+    daily_task_results: dict = None  # {tag: sent|cooldown_skipped}
     last_user_reply_ts: float = 0.0
     consecutive_no_reply_count: int = 0
     next_idle_ts: float = 0.0
@@ -236,6 +238,8 @@ class SessionState:
             # 迁移旧数据
             if self.last_fired_tag:
                 self.last_fired_tags[self.last_fired_tag] = _now_tz(None).timestamp()
+        if self.daily_task_results is None:
+            self.daily_task_results = {}
         if self.msg_timestamps is None:
             self.msg_timestamps = []
         if self.proactive_recent_messages is None:
@@ -246,6 +250,7 @@ class SessionState:
             "last_ts": self.last_ts,
             "last_fired_tag": self.last_fired_tag,  # 保留用于向后兼容
             "last_fired_tags": self.last_fired_tags if self.last_fired_tags else {},
+            "daily_task_results": self.daily_task_results if self.daily_task_results else {},
             "last_user_reply_ts": self.last_user_reply_ts,
             "consecutive_no_reply_count": self.consecutive_no_reply_count,
             "next_idle_ts": self.next_idle_ts,
@@ -260,6 +265,9 @@ class SessionState:
         tags_dict = data.get("last_fired_tags", {})
         if not isinstance(tags_dict, dict):
             tags_dict = {}
+        task_results = data.get("daily_task_results", {})
+        if not isinstance(task_results, dict):
+            task_results = {}
         msg_ts = data.get("msg_timestamps", [])
         if not isinstance(msg_ts, list):
             msg_ts = []
@@ -269,6 +277,7 @@ class SessionState:
             last_ts=data.get("last_ts", 0.0),
             last_fired_tag=data.get("last_fired_tag", ""),
             last_fired_tags=tags_dict,
+            daily_task_results=task_results,
             last_user_reply_ts=data.get("last_user_reply_ts", 0.0),
             consecutive_no_reply_count=data.get("consecutive_no_reply_count", 0),
             next_idle_ts=data.get("next_idle_ts", 0.0),
@@ -299,6 +308,17 @@ class SessionState:
         for t in expired_tags:
             del self.last_fired_tags[t]
 
+    def mark_daily_result(self, tag: str, result: str):
+        """Persist the outcome of a concrete daily greeting task."""
+        self.mark_fired(tag)
+        self.daily_task_results[tag] = result
+        active_tags = set(self.last_fired_tags)
+        self.daily_task_results = {
+            task_tag: task_result
+            for task_tag, task_result in self.daily_task_results.items()
+            if task_tag in active_tags
+        }
+
 
 @dataclass(frozen=True)
 class DailyGreetingTask:
@@ -308,6 +328,28 @@ class DailyGreetingTask:
     prompt: object
     ignore_dnd: bool
     cooldown_minutes: int
+    source_date: date
+    source_type: str = "fixed"
+    activity: str = ""
+    occurrence: int = 0
+    boundary: str = ""
+    base: datetime | None = None
+
+
+@dataclass(frozen=True)
+class DailyGreetingIssue:
+    slot_num: int
+    source_date: date
+    status: str
+    detail: str = ""
+    activity: str = ""
+    occurrence: int = 0
+
+
+@dataclass(frozen=True)
+class DailyGreetingProjection:
+    tasks: list[DailyGreetingTask]
+    issues: list[DailyGreetingIssue]
 
 
 @dataclass
@@ -354,6 +396,7 @@ class Spark(Star):
         self._states: Dict[str, SessionState] = {}
         self._user_profiles: Dict[str, UserProfile] = {}
         self._reminders: Dict[str, Reminder] = {}
+        self._timeline_warning_at: float = 0.0
         
         # 文件保存去抖相关
         self._save_user_data_task: Optional[asyncio.Task] = None
@@ -1552,17 +1595,69 @@ class Spark(Star):
             if remaining_enh > 0:
                 pending.append(f"  对话增强 → 约 {int(remaining_enh / 60)} 分钟后")
 
-        daily_slots = self._parse_daily_slots(now)
-        for idx, actual_time, tag, slot_cfg in daily_slots:
-            if st and st.has_fired(tag):
-                continue
-            slot_dt = now.replace(hour=actual_time[0], minute=actual_time[1], second=0, microsecond=0)
-            diff_sec = (slot_dt - now).total_seconds()
-            if diff_sec > 0:
-                diff_min = int(diff_sec / 60)
-                pending.append(f"  每日问候 {actual_time[0]:02d}:{actual_time[1]:02d} → 约 {diff_min} 分钟后")
+        projection = self._parse_daily_slots(now)
+        today_tasks = [
+            task for task in projection.tasks if task.source_date == now.date()
+        ]
+        today_issues = [
+            issue for issue in projection.issues if issue.source_date == now.date()
+        ]
+        if today_tasks or today_issues:
+            lines.append("今日日程问候:")
+
+        for task in today_tasks:
+            result = st.daily_task_results.get(task.tag, "") if st else ""
+            if result == "sent":
+                status = "已发送"
+            elif result == "cooldown_skipped":
+                status = "冷却跳过"
+            elif st and st.has_fired(task.tag):
+                status = "已处理"
+            elif task.target < now.replace(second=0, microsecond=0):
+                status = "已错过"
             else:
-                pending.append(f"  每日问候 {actual_time[0]:02d}:{actual_time[1]:02d} → 等待触发条件")
+                status = "待触发"
+
+            source = f"每日问候 {task.slot_num + 1}"
+            if task.source_type == "activity":
+                boundary_label = "开始" if task.boundary == "start" else "结束"
+                base_text = task.base.strftime("%m-%d %H:%M") if task.base else "未知"
+                lines.append(
+                    f"  {source}: 第{task.occurrence}次 {task.activity} | "
+                    f"{boundary_label} {base_text} -> {task.target.strftime('%m-%d %H:%M')} | {status}"
+                )
+            else:
+                lines.append(
+                    f"  {source}: 固定时间 -> {task.target.strftime('%m-%d %H:%M')} | {status}"
+                )
+
+            if status == "待触发":
+                diff_min = max(0, int((task.target - now).total_seconds() / 60))
+                pending.append(
+                    f"  每日问候 {task.slot_num + 1} {task.target.strftime('%H:%M')} "
+                    f"→ 约 {diff_min} 分钟后"
+                )
+
+        issue_labels = {
+            "timeline_unavailable": "时间线接口不可用",
+            "timeline_error": "时间线读取失败",
+            "no_schedule": "当天无日程",
+            "not_matched": "未匹配",
+            "invalid_boundary": "边界无效",
+            "no_keywords": "未配置关键词",
+            "invalid_time": "固定时间无效",
+        }
+        for issue in today_issues:
+            label = issue_labels.get(issue.status, issue.status)
+            activity = (
+                f"第{issue.occurrence}次 {issue.activity} | "
+                if issue.activity
+                else ""
+            )
+            lines.append(
+                f"  每日问候 {issue.slot_num + 1}: {activity}{label}"
+                f"（{issue.detail}）"
+            )
 
         if pending:
             lines.append("待触发任务:")
@@ -1834,8 +1929,9 @@ class Spark(Star):
         quiet = self._get_cfg("basic_settings", "quiet_hours", "") or ""
         reply_interval = int(self._get_cfg("basic_settings", "reply_interval_seconds") or 10)
 
-        # 解析每日定时配置（修复：使用 slot1/slot2/slot3 而非 time1/time2/time3）
-        daily_slots = self._parse_daily_slots(now)
+        # Project daily greeting tasks from fixed times and schedule activities
+        daily_projection = self._parse_daily_slots(now)
+        daily_slots = daily_projection.tasks
 
         # Refresh busy state once before the per-user loop
         _force = getattr(self.context, '_busy_schedule_force_check', None)
@@ -1894,6 +1990,9 @@ class Spark(Star):
         base: datetime,
         item: dict,
         occurrence: int = 0,
+        source_type: str = "fixed",
+        activity: str = "",
+        boundary: str = "",
     ) -> DailyGreetingTask:
         policy = parse_policy(item, legacy_jitter_key="jitter_minutes")
         seed = f"daily:{source_date.isoformat()}:{slot_num}:{occurrence}"
@@ -1909,53 +2008,112 @@ class Spark(Star):
             prompt=item.get("prompt", ""),
             ignore_dnd=bool(item.get("ignore_dnd", False)),
             cooldown_minutes=max(0, int(item.get("cooldown_minutes", 0) or 0)),
+            source_date=source_date,
+            source_type=source_type,
+            activity=activity,
+            occurrence=occurrence,
+            boundary=boundary,
+            base=base,
         )
 
-    def _activity_daily_tasks(
+    def _activity_daily_projection(
         self, slot_num: int, item: dict, source_date: date, now: datetime
-    ) -> list[DailyGreetingTask]:
+    ) -> DailyGreetingProjection:
         get_timeline = getattr(self.context, "_busy_schedule_get_timeline", None)
         if not callable(get_timeline):
-            return []
+            if now.timestamp() - self._timeline_warning_at >= 300:
+                logger.warning(
+                    "[Spark] 忙碌日程结构化时间线接口不可用；"
+                    "活动每日问候将在接口注册后自动恢复"
+                )
+                self._timeline_warning_at = now.timestamp()
+            return DailyGreetingProjection(
+                tasks=[],
+                issues=[
+                    DailyGreetingIssue(
+                        slot_num=slot_num,
+                        source_date=source_date,
+                        status="timeline_unavailable",
+                        detail="忙碌日程时间线接口不可用",
+                    )
+                ],
+            )
+
         keywords = [
             str(keyword).strip()
             for keyword in item.get("activity_keywords", [])
             if str(keyword).strip()
         ]
         if not keywords:
-            return []
+            return DailyGreetingProjection(
+                tasks=[],
+                issues=[
+                    DailyGreetingIssue(
+                        slot_num=slot_num,
+                        source_date=source_date,
+                        status="no_keywords",
+                        detail="未配置活动关键词",
+                    )
+                ],
+            )
         try:
             timeline = get_timeline(source_date)
         except Exception as exc:
             logger.warning(f"[Spark] 获取结构化日程失败({source_date}): {exc}")
-            return []
+            return DailyGreetingProjection(
+                tasks=[],
+                issues=[
+                    DailyGreetingIssue(
+                        slot_num=slot_num,
+                        source_date=source_date,
+                        status="timeline_error",
+                        detail=str(exc),
+                    )
+                ],
+            )
 
-        matches = [
-            activity
-            for activity in timeline
-            if any(keyword in str(activity.get("activity", "")) for keyword in keywords)
-        ]
+        if not timeline:
+            return DailyGreetingProjection(
+                tasks=[],
+                issues=[
+                    DailyGreetingIssue(
+                        slot_num=slot_num,
+                        source_date=source_date,
+                        status="no_schedule",
+                        detail="当天没有可用日程",
+                    )
+                ],
+            )
+
         selected = parse_occurrences(item.get("activity_occurrences"))
         boundary_value = str(
             item.get("activity_boundary", "活动开始") or "活动开始"
         )
         boundary = "end" if boundary_value in {"end", "活动结束"} else "start"
+        candidate_projection = project_activity_candidates(
+            timeline, keywords, selected, boundary
+        )
         tasks = []
-        for occurrence, activity in enumerate(matches, start=1):
-            if selected is not None and occurrence not in selected:
-                continue
-            if not activity.get("valid", True):
+        issues = [
+            DailyGreetingIssue(
+                slot_num=slot_num,
+                source_date=source_date,
+                status=issue.status,
+                detail=issue.detail,
+                activity=issue.activity,
+                occurrence=issue.occurrence,
+            )
+            for issue in candidate_projection.issues
+        ]
+        for issue in candidate_projection.issues:
+            if issue.status == "invalid_boundary":
                 logger.warning(
-                    f"[Spark] 跳过无效日程活动: {activity.get('activity', '')} "
-                    f"({activity.get('error', 'unknown error')})"
+                    f"[Spark] 跳过无效日程活动: {issue.activity} ({issue.detail})"
                 )
-                continue
-            base = self._coerce_schedule_datetime(activity.get(boundary), now)
+
+        for candidate in candidate_projection.candidates:
+            base = self._coerce_schedule_datetime(candidate.boundary, now)
             if base is None:
-                logger.warning(
-                    f"[Spark] 跳过缺少{boundary}边界的活动: "
-                    f"{activity.get('activity', '')}"
-                )
                 continue
             tasks.append(
                 self._daily_task(
@@ -1963,17 +2121,25 @@ class Spark(Star):
                     source_date=source_date,
                     base=base,
                     item=item,
-                    occurrence=occurrence,
+                    occurrence=candidate.occurrence,
+                    source_type="activity",
+                    activity=candidate.activity,
+                    boundary=boundary,
                 )
             )
-        return tasks
+        return DailyGreetingProjection(tasks=tasks, issues=issues)
 
-    def _parse_daily_slots(self, now: datetime) -> list[DailyGreetingTask]:
+    def _parse_daily_slots(self, now: datetime) -> DailyGreetingProjection:
         """Project fixed-time and schedule-driven greetings onto concrete datetimes."""
         daily = self.cfg.get("daily_prompts") or {}
         greetings = daily.get("daily_greetings", [])
         tasks: list[DailyGreetingTask] = []
-        source_dates = [now.date() - timedelta(days=1), now.date(), now.date() + timedelta(days=1)]
+        issues: list[DailyGreetingIssue] = []
+        source_dates = [
+            now.date() - timedelta(days=1),
+            now.date(),
+            now.date() + timedelta(days=1),
+        ]
 
         if isinstance(greetings, list) and greetings:
             for idx, item in enumerate(greetings):
@@ -1984,15 +2150,27 @@ class Spark(Star):
                     "日程活动",
                 }:
                     for source_date in source_dates:
-                        tasks.extend(
-                            self._activity_daily_tasks(idx, item, source_date, now)
+                        projection = self._activity_daily_projection(
+                            idx, item, source_date, now
                         )
+                        tasks.extend(projection.tasks)
+                        issues.extend(projection.issues)
                     continue
                 parsed = _parse_hhmm(str(item.get("time", "")))
                 if not parsed:
+                    issues.append(
+                        DailyGreetingIssue(
+                            slot_num=idx,
+                            source_date=now.date(),
+                            status="invalid_time",
+                            detail="固定时间格式无效",
+                        )
+                    )
                     continue
                 for source_date in source_dates:
-                    base = datetime.combine(source_date, time(*parsed), tzinfo=now.tzinfo)
+                    base = datetime.combine(
+                        source_date, time(*parsed), tzinfo=now.tzinfo
+                    )
                     tasks.append(
                         self._daily_task(
                             slot_num=idx,
@@ -2001,7 +2179,7 @@ class Spark(Star):
                             item=item,
                         )
                     )
-            return tasks
+            return DailyGreetingProjection(tasks=tasks, issues=issues)
 
         for slot_num in [1, 2, 3]:
             slot_cfg = daily.get(f"slot{slot_num}", {})
@@ -2021,7 +2199,7 @@ class Spark(Star):
                         item={"prompt": prompt},
                     )
                 )
-        return tasks
+        return DailyGreetingProjection(tasks=tasks, issues=issues)
 
     async def _check_idle_greeting(self, umo: str, st: Optional[SessionState], now: datetime, 
                                    tz: Optional[str], reply_interval: int):
@@ -2158,7 +2336,7 @@ class Spark(Star):
                     f"[Spark] 每日问候跳过: {umo} "
                     f"(聊天冷却 {task.cooldown_minutes} 分钟)"
                 )
-                st.mark_fired(task.tag)
+                st.mark_daily_result(task.tag, "cooldown_skipped")
                 continue
 
             if not task.ignore_dnd and (is_in_dnd or is_busy):
@@ -2195,7 +2373,7 @@ class Spark(Star):
                 umo, tz, prompt_template, skip_judge=True
             )
             if ok:
-                st.mark_fired(task.tag)
+                st.mark_daily_result(task.tag, "sent")
                 if reply_interval > 0:
                     await asyncio.sleep(reply_interval)
             else:
