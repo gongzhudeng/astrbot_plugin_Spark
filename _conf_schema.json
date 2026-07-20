@@ -182,6 +182,14 @@
         "default": "",
         "_special": "select_provider"
       },
+      "proactive_judge_fallback_providers": {
+        "description": "判断回退模型列表",
+        "hint": "判断主模型请求持续失败或返回空内容时，按此顺序切换；可拖动排序，不限数量",
+        "type": "list",
+        "items": { "type": "string" },
+        "default": [],
+        "_special": "select_providers"
+      },
       "judge_persona_id": {
         "description": "判断模型人格",
         "hint": "留空则使用当前对话的人格",
@@ -213,6 +221,21 @@
         "type": "string",
         "default": "",
         "_special": "select_provider"
+      },
+      "generation_fallback_mode": {
+        "description": "生成回退来源",
+        "hint": "插件独立回退=使用下方列表；跟随 AstrBot 对话回退=使用当前会话在 AstrBot 中配置的回退对话模型列表",
+        "type": "string",
+        "options": ["插件独立回退", "跟随 AstrBot 对话回退"],
+        "default": "插件独立回退"
+      },
+      "generation_fallback_providers": {
+        "description": "生成回退模型列表",
+        "hint": "仅在生成回退来源为“插件独立回退”时生效；按顺序切换，可拖动排序，不限数量",
+        "type": "list",
+        "items": { "type": "string" },
+        "default": [],
+        "_special": "select_providers"
       },
       "gen_persona_id": {
         "description": "生成模型人格",

@@ -24,6 +24,13 @@ from .core.history_content import (
     extract_history_text,
     find_datetime_reminder,
 )
+from .core.provider_fallback import (
+    ASTRBOT_FALLBACK_MODE,
+    dedupe_provider_chain,
+    normalize_provider_ids,
+    resolve_provider_chain,
+    select_generation_fallback_ids,
+)
 from .core.time_policy import (
     apply_datetime_policy,
     apply_delay_policy,
@@ -423,7 +430,7 @@ class Reminder:
     "astrbot_plugin_Spark",
     "灵犀 · 主动对话",
     "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候",
-    "1.4.0",
+    "2.4.0",
     "https://github.com/gongzhudeng/astrbot_plugin_Spark",
 )
 class Spark(Star):
@@ -479,7 +486,8 @@ class Spark(Star):
                 import warnings
 
                 warnings.warn(
-                    "[Spark] 无法使用 StarTools，使用 os.getcwd() 作为后备方案"
+                    "[Spark] 无法使用 StarTools，使用 os.getcwd() 作为后备方案",
+                    stacklevel=2,
                 )
                 root = os.getcwd()
                 self._data_dir = _ensure_dir(
@@ -2798,6 +2806,79 @@ class Spark(Star):
             except Exception as e:
                 logger.debug(f"[Spark] 刷新 busy_schedule 状态失败: {e}")
 
+    @staticmethod
+    def _provider_id(provider) -> str:
+        config = getattr(provider, "provider_config", None)
+        if not isinstance(config, dict):
+            return ""
+        return str(config.get("id") or "").strip()
+
+    def _resolve_provider_chain(
+        self,
+        *,
+        umo: str,
+        primary_id: object,
+        fallback_ids: object,
+        purpose: str,
+    ) -> list:
+        normalized_primary_id = str(primary_id or "").strip()
+        try:
+            current_provider = self.context.get_using_provider(umo=umo)
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"[Spark] 获取当前对话模型失败({umo}): {exc}")
+            current_provider = None
+
+        providers, missing_ids = resolve_provider_chain(
+            primary_id=normalized_primary_id,
+            fallback_ids=fallback_ids,
+            get_provider=self.context.get_provider_by_id,
+            current_provider=current_provider,
+        )
+        for provider_id in missing_ids:
+            role = "主模型" if provider_id == normalized_primary_id else "回退模型"
+            suffix = "，使用当前对话模型" if role == "主模型" else "，已跳过"
+            logger.warning(f"[Spark] {purpose}{role} '{provider_id}' 不存在{suffix}")
+        return providers
+
+    def _astrbot_generation_fallback_ids(self, umo: str) -> list[str]:
+        astrbot_config = self.context.get_config(umo=umo)
+        provider_settings = (
+            astrbot_config.get("provider_settings", {}) if astrbot_config else {}
+        )
+        if not isinstance(provider_settings, dict):
+            return []
+        return normalize_provider_ids(provider_settings.get("fallback_chat_models", []))
+
+    def _get_judge_providers(self, umo: str) -> list:
+        return self._resolve_provider_chain(
+            umo=umo,
+            primary_id=self._get_cfg(
+                "proactive_settings", "proactive_judge_provider", ""
+            ),
+            fallback_ids=self._get_cfg(
+                "proactive_settings", "proactive_judge_fallback_providers", []
+            ),
+            purpose="判断",
+        )
+
+    def _get_gen_providers(self, umo: str) -> list:
+        mode = self._get_cfg(
+            "proactive_settings", "generation_fallback_mode", "插件独立回退"
+        )
+        fallback_ids = select_generation_fallback_ids(
+            mode,
+            self._get_cfg("proactive_settings", "generation_fallback_providers", []),
+            self._astrbot_generation_fallback_ids(umo),
+        )
+        if str(mode or "").strip() == ASTRBOT_FALLBACK_MODE:
+            logger.debug(f"[Spark] 生成模型回退跟随 AstrBot 当前会话配置: {umo}")
+        return self._resolve_provider_chain(
+            umo=umo,
+            primary_id=self._get_cfg("proactive_settings", "fixed_provider", ""),
+            fallback_ids=fallback_ids,
+            purpose="生成",
+        )
+
     async def _judge_should_reply(
         self,
         umo: str,
@@ -2957,15 +3038,9 @@ class Spark(Star):
                 logger.warning(f"[Spark] Judge prompt format error: {e}")
                 judge_prompt = judge_template
 
-            judge_provider_id = (
-                self._get_cfg("proactive_settings", "proactive_judge_provider") or ""
-            )
-            provider = None
-            if judge_provider_id:
-                provider = self.context.get_provider_by_id(judge_provider_id)
-            if not provider:
-                provider = self.context.get_using_provider(umo=umo)
-            if not provider:
+            providers = self._get_judge_providers(umo)
+            if not providers:
+                logger.warning(f"[Spark] 判断模型链为空({umo})，默认允许主动回复")
                 return True
 
             judge_persona = self._resolve_persona(
@@ -2976,60 +3051,66 @@ class Spark(Star):
             if not judge_persona:
                 judge_persona = "你是一个对话判断助手，只回复是或否"
 
-            _JUDGE_RETRIES = 3
-            _RETRYABLE = (502, 503, 504)
+            judge_retries = 3
             last_err = None
-            for attempt in range(_JUDGE_RETRIES):
-                try:
-                    llm_resp = await provider.text_chat(
-                        prompt=None,
-                        contexts=judge_contexts
-                        + [
-                            {"role": "user", "content": judge_prompt},
-                            {"role": "user", "content": judge_rules},
-                        ],
-                        system_prompt=judge_persona,
+            for provider_index, provider in enumerate(providers):
+                provider_id = self._provider_id(provider) or "<unknown>"
+                if provider_index:
+                    logger.warning(
+                        f"[Spark] 判断模型切换到回退供应商: {provider_id} ({umo})"
                     )
-                    response = (
-                        llm_resp.completion_text
-                        if hasattr(llm_resp, "completion_text")
-                        else ""
-                    ).strip()
-                    if not response:
-                        raise ValueError("Empty completion text")
-
-                    should_reply = "是" in response[:10]
-                    if should_reply:
-                        logger.info(f"[Spark] Judge YES for {umo}: '{response[:20]}'")
-                    else:
-                        logger.info(f"[Spark] Judge NO for {umo}: '{response[:20]}'")
-                    return should_reply
-
-                except Exception as e:
-                    last_err = e
-                    is_retryable = False
-                    err_str = str(e)
-                    if any(code in err_str for code in ("502", "503", "504")):
-                        is_retryable = True
-                    if (
-                        "no usable output" in err_str.lower()
-                        or "empty" in err_str.lower()
-                    ):
-                        is_retryable = True
-                    if "timeout" in err_str.lower() or "connect" in err_str.lower():
-                        is_retryable = True
-
-                    if is_retryable and attempt < _JUDGE_RETRIES - 1:
-                        wait = 2 ** (attempt + 1)
-                        logger.warning(
-                            f"[Spark] Judge retry {attempt + 1}/{_JUDGE_RETRIES} for {umo}: {e}, waiting {wait}s"
+                for attempt in range(judge_retries):
+                    try:
+                        llm_resp = await provider.text_chat(
+                            prompt=None,
+                            contexts=judge_contexts
+                            + [
+                                {"role": "user", "content": judge_prompt},
+                                {"role": "user", "content": judge_rules},
+                            ],
+                            system_prompt=judge_persona,
                         )
-                        await asyncio.sleep(wait)
-                    else:
+                        response = (
+                            llm_resp.completion_text
+                            if hasattr(llm_resp, "completion_text")
+                            else ""
+                        ).strip()
+                        if not response:
+                            raise ValueError("Empty completion text")
+
+                        should_reply = "是" in response[:10]
+                        result = "YES" if should_reply else "NO"
+                        logger.info(
+                            f"[Spark] Judge {result} for {umo} via {provider_id}: "
+                            f"'{response[:20]}'"
+                        )
+                        return should_reply
+
+                    except Exception as e:
+                        last_err = e
+                        err_str = str(e).lower()
+                        is_retryable = (
+                            any(code in err_str for code in ("502", "503", "504"))
+                            or "no usable output" in err_str
+                            or "empty" in err_str
+                            or "timeout" in err_str
+                            or "connect" in err_str
+                        )
+                        if is_retryable and attempt < judge_retries - 1:
+                            wait = 2 ** (attempt + 1)
+                            logger.warning(
+                                f"[Spark] Judge retry {attempt + 1}/{judge_retries} "
+                                f"via {provider_id} for {umo}: {e}, waiting {wait}s"
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+                        logger.warning(
+                            f"[Spark] 判断模型 {provider_id} 调用失败({umo}): {e}"
+                        )
                         break
 
             logger.error(
-                f"[Spark] Judge failed after {_JUDGE_RETRIES} attempts for {umo}: {last_err}, defaulting to allow"
+                f"[Spark] 所有判断模型均失败({umo}): {last_err}，默认允许主动回复"
             )
             return True
 
@@ -3055,13 +3136,9 @@ class Spark(Star):
         return ""
 
     def _get_gen_provider(self, umo: str):
-        """Resolve the LLM provider for the generate step."""
-        pid = self._get_cfg("proactive_settings", "fixed_provider", "") or ""
-        if pid:
-            p = self.context.get_provider_by_id(pid)
-            if p:
-                return p
-        return self.context.get_using_provider(umo=umo)
+        """Resolve the primary LLM provider for compatibility with older callers."""
+        providers = self._get_gen_providers(umo)
+        return providers[0] if providers else None
 
     async def _get_gen_persona(self, umo: str = "") -> str:
         """Resolve the system persona for the generate step via persona_mgr.
@@ -3820,8 +3897,21 @@ class Spark(Star):
             streaming_response=False,
         )
 
-        if not provider:
-            provider = self._get_gen_provider(umo)
+        generation_providers = self._get_gen_providers(umo)
+        if provider:
+            generation_providers = dedupe_provider_chain(
+                [provider, *generation_providers]
+            )
+        if not generation_providers:
+            logger.warning(f"[Spark] 生成模型链为空: {umo}")
+            return None
+        provider = generation_providers[0]
+        config.provider_settings = dict(config.provider_settings)
+        config.provider_settings["fallback_chat_models"] = [
+            provider_id
+            for candidate in generation_providers[1:]
+            if (provider_id := self._provider_id(candidate))
+        ]
 
         req = ProviderRequest()
         req.prompt = prompt
@@ -3959,9 +4049,10 @@ class Spark(Star):
         self, umo: str, prompt: str, provider=None, persona: str = ""
     ) -> Optional[str]:
         """Fallback: direct provider.text_chat() for older framework versions."""
-        if not provider:
-            provider = self._get_gen_provider(umo)
-        if not provider:
+        providers = self._get_gen_providers(umo)
+        if provider:
+            providers = dedupe_provider_chain([provider, *providers])
+        if not providers:
             logger.warning(f"[Spark] provider missing for {umo}")
             return None
 
@@ -3980,13 +4071,35 @@ class Spark(Star):
             f"{self._format_context_tail_for_log(contexts)}"
         )
 
-        llm_resp = await provider.text_chat(
-            prompt=None,
-            contexts=[{"role": "user", "content": prompt}] + contexts,
-            system_prompt=persona,
-        )
-        text = llm_resp.completion_text if hasattr(llm_resp, "completion_text") else ""
-        return text.strip() if text else None
+        last_err = None
+        for provider_index, candidate in enumerate(providers):
+            provider_id = self._provider_id(candidate) or "<unknown>"
+            if provider_index:
+                logger.warning(
+                    f"[Spark] 旧生成路径切换到回退供应商: {provider_id} ({umo})"
+                )
+            try:
+                llm_resp = await candidate.text_chat(
+                    prompt=None,
+                    contexts=[{"role": "user", "content": prompt}] + contexts,
+                    system_prompt=persona,
+                )
+                text = (
+                    llm_resp.completion_text
+                    if hasattr(llm_resp, "completion_text")
+                    else ""
+                )
+                if text and text.strip():
+                    return text.strip()
+                raise ValueError("Empty completion text")
+            except Exception as exc:
+                last_err = exc
+                logger.warning(
+                    f"[Spark] 旧生成路径模型 {provider_id} 调用失败({umo}): {exc}"
+                )
+
+        logger.error(f"[Spark] 所有生成模型均失败({umo}): {last_err}")
+        return None
 
     async def _proactive_reminder_reply(self, umo: str, reminder_content: str) -> bool:
         """
@@ -4371,7 +4484,7 @@ class Spark(Star):
                 pass  # 预期的取消异常
 
         # 取消所有对话增强任务
-        for umo, task in list(self._enhancement_tasks.items()):
+        for task in list(self._enhancement_tasks.values()):
             if task and not task.done():
                 task.cancel()
         self._enhancement_tasks.clear()
