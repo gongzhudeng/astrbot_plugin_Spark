@@ -24,6 +24,7 @@ from .core.history_content import (
     extract_history_text,
     find_datetime_reminder,
 )
+from .core.message_input import is_slash_prefixed_message
 from .core.provider_fallback import (
     ASTRBOT_FALLBACK_MODE,
     dedupe_provider_chain,
@@ -95,6 +96,16 @@ except ImportError as exc:
 
 
 # 工具函数
+def _is_slash_prefixed_event(event: AstrMessageEvent) -> bool:
+    marker = "spark_slash_input"
+    cached = event.get_extra(marker, None)
+    if isinstance(cached, bool):
+        return cached
+    is_slash = is_slash_prefixed_message(event.get_messages())
+    event.set_extra(marker, is_slash)
+    return is_slash
+
+
 def _ensure_dir(p: str) -> str:
     """确保目录存在，不存在则创建"""
     os.makedirs(p, exist_ok=True)
@@ -1065,24 +1076,15 @@ class Spark(Star):
         st = self._states[umo]
         profile = self._user_profiles[umo]
 
-        # Determine if this is a real chat message vs. a slash command.
-        # We cannot rely on startswith('/') because AstrBot strips wake_prefix
-        # (which is '/') from event.message_str before passing to plugins.
-        # Instead, check activated_handlers: if this event activated any of
-        # Spark's own command handlers, it is a command, not real chat.
+        # Detect commands from the untouched source message chain because AstrBot
+        # removes the wake prefix from event.message_str before plugin hooks run.
         message_text = (
             event.message_str.strip()
             if hasattr(event, "message_str") and event.message_str
             else ""
         )
-        _activated = event.get_extra("activated_handlers") or []
-        _spark_module = __name__  # 'data.plugins.astrbot_plugin_Spark.main'
-        _is_spark_cmd = any(
-            getattr(h, "handler_module_path", "") == _spark_module
-            and getattr(h, "handler_name", "").startswith("_cmd_")
-            for h in _activated
-        )
-        is_real_message = bool(message_text) and not _is_spark_cmd
+        is_slash_input = _is_slash_prefixed_event(event)
+        is_real_message = bool(message_text) and not is_slash_input
 
         # Enhancement task cancellation is handled inside _delayed_enhancement
         # via last_user_reply_ts check. Do NOT cancel here — it would kill tasks
@@ -1095,8 +1097,8 @@ class Spark(Star):
         now_ts = _now_tz(
             self._get_cfg("basic_settings", "timezone") or None
         ).timestamp()
-        st.last_ts = now_ts
         if is_real_message:
+            st.last_ts = now_ts
             st.last_user_reply_ts = now_ts
             if not event.get_extra(self._heat_event_marker, False):
                 if st.msg_timestamps is None:
@@ -1105,10 +1107,14 @@ class Spark(Star):
                 if len(st.msg_timestamps) > 100:
                     st.msg_timestamps = st.msg_timestamps[-100:]
                 event.set_extra(self._heat_event_marker, True)
-        st.consecutive_no_reply_count = 0
+            st.consecutive_no_reply_count = 0
 
-        # 自动订阅模式：仅在首次创建用户时自动订阅
-        if (self._get_cfg("basic_settings", "subscribe_mode") or "manual") == "auto":
+        # 自动订阅模式：仅在首次创建用户且收到真实消息时自动订阅
+        if (
+            is_real_message
+            and (self._get_cfg("basic_settings", "subscribe_mode") or "manual")
+            == "auto"
+        ):
             # 只在用户第一次发消息时（old_last_user_reply_ts == 0）自动订阅
             if old_last_user_reply_ts == 0 and not profile.manual_unsubscribe:
                 profile.subscribed = True
@@ -1118,7 +1124,8 @@ class Spark(Star):
 
         # 自动重新激活：仅对"被自动退订"的用户生效，手动退订的用户不会被自动重新激活
         if (
-            not profile.subscribed
+            is_real_message
+            and not profile.subscribed
             and profile.auto_unsubscribed
             and not profile.manual_unsubscribe
         ):
@@ -1162,6 +1169,8 @@ class Spark(Star):
         try:
             if HAS_AGENT_PIPELINE and isinstance(event, CronMessageEvent):
                 return
+            if _is_slash_prefixed_event(event):
+                return
             umo = event.unified_msg_origin
             st = self._states.get(umo)
             if not st:
@@ -1202,6 +1211,8 @@ class Spark(Star):
         try:
             # Skip proactive replies triggered by this plugin itself (CronMessageEvent)
             if HAS_AGENT_PIPELINE and isinstance(event, CronMessageEvent):
+                return
+            if _is_slash_prefixed_event(event):
                 return
             umo = event.unified_msg_origin
             st = self._states.get(umo)
@@ -1722,7 +1733,11 @@ class Spark(Star):
         yield event.plain_result("正在发送主动消息...")
         tz = self._get_cfg("basic_settings", "timezone") or None
         await self._proactive_reply(
-            umo, tz, random.choice(idle_prompts), skip_judge=True
+            umo,
+            tz,
+            random.choice(idle_prompts),
+            skip_judge=True,
+            slash_triggered=True,
         )
 
     # 主动状态：显示当前订阅和运行状态
@@ -3522,6 +3537,7 @@ class Spark(Star):
         prompt_template: str,
         skip_judge: bool = False,
         judge_current_round: Optional[dict] = None,
+        slash_triggered: bool = False,
     ) -> bool:
         """
         执行主动回复的核心方法
@@ -3532,6 +3548,7 @@ class Spark(Star):
 
         Args:
             skip_judge: 为 True 时跳过 LLM 判断步骤，必定触发回复（用于每日问候等定时任务）
+            slash_triggered: 为 True 时保留发送和历史，但不更新聊天时间
         """
         try:
             # Step 1: Judge whether to reply (skip for daily greetings etc.)
@@ -3637,7 +3654,12 @@ class Spark(Star):
 
             if HAS_AGENT_PIPELINE:
                 response_text = await self._run_agent_pipeline(
-                    umo, prompt, tz, provider=gen_provider, persona=gen_persona
+                    umo,
+                    prompt,
+                    tz,
+                    provider=gen_provider,
+                    persona=gen_persona,
+                    slash_triggered=slash_triggered,
                 )
             else:
                 logger.error(
@@ -3676,14 +3698,15 @@ class Spark(Star):
                 except Exception as e:
                     logger.warning(f"[Spark] 保存主动回复历史失败: {e}")
 
-            # Update state
-            now_ts = now.timestamp()
-            if umo not in self._states:
-                self._states[umo] = SessionState()
-            st = self._states[umo]
-            st.last_ts = now_ts
-            st.last_proactive_reply_ts = now_ts
-            await self._debounced_save_session_data()
+            # Update state only for naturally triggered proactive conversations.
+            if not slash_triggered:
+                now_ts = now.timestamp()
+                if umo not in self._states:
+                    self._states[umo] = SessionState()
+                st = self._states[umo]
+                st.last_ts = now_ts
+                st.last_proactive_reply_ts = now_ts
+                await self._debounced_save_session_data()
 
             return True
 
@@ -3879,6 +3902,7 @@ class Spark(Star):
         tz: Optional[str] = None,
         provider=None,
         persona: str = "",
+        slash_triggered: bool = False,
     ) -> Optional[str]:
         """通过官方 CronMessageEvent + build_main_agent 执行 Agent Pipeline"""
         self._last_cron_event_sent = False
@@ -3947,6 +3971,7 @@ class Spark(Star):
         generation_prompt = prompt
         req.prompt = retrieval_query
         cron_event.set_extra("spark_proactive_retrieval", True)
+        cron_event.set_extra("spark_slash_triggered", slash_triggered)
 
         result = await build_main_agent(
             event=cron_event,
