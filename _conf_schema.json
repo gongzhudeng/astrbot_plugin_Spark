@@ -101,10 +101,22 @@
         "default": true
       },
       "heat_window_minutes": {
-        "description": "热度观察窗口（分钟）",
-        "hint": "插件往回看多少分钟内的消息记录来评估热度，窗口外的消息自动淡出。旧配置 heat_window_hours 会自动兼容",
+        "description": "短期热度窗口（分钟）",
+        "hint": "衡量刚才是否密集聊天；旧配置继续直接作为短期窗口使用",
         "type": "int",
-        "default": 240
+        "default": 45
+      },
+      "heat_long_window_minutes": {
+        "description": "长期余温窗口（分钟）",
+        "hint": "衡量近半天到一天是否聊过，避免短期窗口结束后热度立即归零；建议 480~1440",
+        "type": "int",
+        "default": 720
+      },
+      "heat_short_weight": {
+        "description": "短期热度权重",
+        "hint": "0~1，剩余权重用于长期余温；0.7 表示短期 70%、长期 30%",
+        "type": "float",
+        "default": 0.7
       },
       "heat_messages_for_full_score": {
         "description": "满热所需消息数",
@@ -120,9 +132,9 @@
       },
       "cold_delay_minutes": {
         "description": "冷场触发延迟（分钟）",
-        "hint": "热度为零（长时间无消息）时的触发间隔，相当于原来的 idle_after_minutes 最大值",
+        "hint": "热度为零时的最长等待；与热场延迟之间使用非线性映射，200 表示最冷时约 3 小时 20 分钟",
         "type": "int",
-        "default": 1200
+        "default": 200
       }
     }
   },
@@ -133,23 +145,25 @@
     "items": {
       "enable_enhancement": {
         "description": "启用对话增强",
+        "hint": "每次普通回复后安排一次候选检查，最终是否开口仍由智能判断决定",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "enhancement_probability": {
-        "description": "触发概率（%）",
-        "hint": "0~100，每次 AI 回复后的触发概率",
+        "description": "进入智能判断的概率（%）",
+        "hint": "建议保持 100，让智能判断负责是否真正开口",
         "type": "int",
-        "default": 20
+        "default": 100
       },
-      "enhancement_min_delay": {
-        "description": "最短等待（秒）",
+      "enhancement_hot_delay_seconds": {
+        "description": "热场等待（秒）",
+        "hint": "热度最高时等待多久进入智能判断",
         "type": "int",
-        "default": 30
+        "default": 45
       },
-      "enhancement_max_delay": {
-        "description": "最长等待（秒）",
-        "hint": "上限 1800",
+      "enhancement_cold_delay_seconds": {
+        "description": "冷场等待（秒）",
+        "hint": "热度为零时等待多久进入智能判断；与热场等待之间使用非线性映射，上限 1800",
         "type": "int",
         "default": 600
       },

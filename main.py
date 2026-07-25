@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import random
 import re
@@ -10,13 +9,18 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from astrbot.api import logger, AstrBotConfig
-from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 from .core.daily_projection import (
     project_activity_candidates,
     select_highest_priority,
+)
+from .core.heat_policy import (
+    dual_scale_heat,
+    geometric_delay,
+    heat_scaled_delay_seconds,
 )
 from .core.history_content import (
     build_proactive_user_content,
@@ -53,8 +57,8 @@ except ImportError:
 try:
     from astrbot.core.agent.message import (
         AssistantMessageSegment,
-        UserMessageSegment,
         TextPart,
+        UserMessageSegment,
     )
 
     HAS_NEW_MESSAGE_API = True
@@ -78,14 +82,14 @@ except ImportError:
 
 # 导入官方 Agent Pipeline API（用于主动回复走合规调用）
 try:
-    from astrbot.core.cron.events import CronMessageEvent
     from astrbot.core.astr_main_agent import (
         build_main_agent,
         build_main_agent_config,
     )
-    from astrbot.core.provider.entities import ProviderRequest
-    from astrbot.core.platform.message_session import MessageSession
+    from astrbot.core.cron.events import CronMessageEvent
     from astrbot.core.pipeline.context import call_event_hook
+    from astrbot.core.platform.message_session import MessageSession
+    from astrbot.core.provider.entities import ProviderRequest
     from astrbot.core.star.star_handler import EventType
 
     HAS_AGENT_PIPELINE = True
@@ -140,18 +144,15 @@ def _compute_heat(
     window_minutes: float,
     full_score_messages: float = 10.0,
 ) -> float:
-    """Compute a [0.0, 1.0] conversation heat score using exponential decay."""
-    if not msg_timestamps:
-        return 0.0
-    window_minutes = max(float(window_minutes or 1), 1.0)
-    full_score_messages = max(float(full_score_messages or 10), 1.0)
-    window_sec = window_minutes * 60.0
-    total = sum(
-        math.exp(-3.0 * (now_ts - t) / window_sec)
-        for t in msg_timestamps
-        if 0 <= now_ts - t <= window_sec
+    """Compatibility wrapper for the original single-window heat calculation."""
+    return dual_scale_heat(
+        msg_timestamps,
+        now_ts,
+        short_window_minutes=window_minutes,
+        long_window_minutes=window_minutes,
+        messages_for_full_score=full_score_messages,
+        short_weight=1.0,
     )
-    return min(total / full_score_messages, 1.0)
 
 
 def _parse_hhmm(s: str) -> Optional[Tuple[int, int]]:
@@ -766,22 +767,38 @@ class Spark(Star):
         except (TypeError, ValueError):
             return int(default)
 
-    def _get_heat_args(self) -> tuple[float, float]:
+    def _get_heat_args(self) -> tuple[float, float, float, float]:
         heat_cfg = self.cfg.get("heat_settings") or {}
         if not isinstance(heat_cfg, dict):
             heat_cfg = {}
-        window_minutes = heat_cfg.get("heat_window_minutes")
-        if window_minutes is None:
-            window_minutes = float(heat_cfg.get("heat_window_hours", 4) or 4) * 60.0
+        short_window_minutes = heat_cfg.get("heat_window_minutes")
+        if short_window_minutes is None:
+            short_window_minutes = (
+                float(heat_cfg.get("heat_window_hours", 4) or 4) * 60.0
+            )
+        long_window_minutes = heat_cfg.get("heat_long_window_minutes", 720)
         full_score_messages = float(
             heat_cfg.get("heat_messages_for_full_score", 10) or 10
         )
-        return max(float(window_minutes or 1), 1.0), max(full_score_messages, 1.0)
+        short_weight = float(heat_cfg.get("heat_short_weight", 0.7) or 0.7)
+        return (
+            max(float(short_window_minutes or 1), 1.0),
+            max(float(long_window_minutes or 1), 1.0),
+            max(full_score_messages, 1.0),
+            min(max(short_weight, 0.0), 1.0),
+        )
 
     def _calc_heat(self, st: "SessionState", now_ts: float) -> float:
-        window_m, full_score_messages = self._get_heat_args()
-        return _compute_heat(
-            st.msg_timestamps or [], now_ts, window_m, full_score_messages
+        short_window_m, long_window_m, full_score_messages, short_weight = (
+            self._get_heat_args()
+        )
+        return dual_scale_heat(
+            st.msg_timestamps or [],
+            now_ts,
+            short_window_minutes=short_window_m,
+            long_window_minutes=long_window_m,
+            messages_for_full_score=full_score_messages,
+            short_weight=short_weight,
         )
 
     def _calc_idle_delay(
@@ -796,10 +813,10 @@ class Spark(Star):
         if heat_enabled:
             hot_m = float(self._get_cfg("heat_settings", "hot_delay_minutes", 30) or 30)
             cold_m = float(
-                self._get_cfg("heat_settings", "cold_delay_minutes", 1200) or 1200
+                self._get_cfg("heat_settings", "cold_delay_minutes", 200) or 200
             )
             heat = self._calc_heat(st, now_ts)
-            delay_m = hot_m + (cold_m - hot_m) * (1.0 - heat)
+            delay_m = geometric_delay(hot_m, cold_m, heat)
             logger.debug(f"[Spark] 热度计算: heat={heat:.2f}, delay={delay_m:.0f}m")
             return delay_m
 
@@ -1401,7 +1418,9 @@ class Spark(Star):
             st_debug = self._states.get(umo)
             heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
             if heat_enabled and st_debug:
-                _window_m, _full_score_messages = self._get_heat_args()
+                _short_window_m, _long_window_m, _full_score_messages, _short_weight = (
+                    self._get_heat_args()
+                )
                 _heat_val = self._calc_heat(
                     st_debug,
                     _now_tz(
@@ -1412,9 +1431,9 @@ class Spark(Star):
                     self._get_cfg("heat_settings", "hot_delay_minutes", 30) or 30
                 )
                 _cold_m = float(
-                    self._get_cfg("heat_settings", "cold_delay_minutes", 1200) or 1200
+                    self._get_cfg("heat_settings", "cold_delay_minutes", 200) or 200
                 )
-                _next_delay = _hot_m + (_cold_m - _hot_m) * (1.0 - _heat_val)
+                _next_delay = geometric_delay(_hot_m, _cold_m, _heat_val)
                 if _heat_val >= 0.6:
                     _heat_label = "热"
                 elif _heat_val >= 0.2:
@@ -1425,7 +1444,11 @@ class Spark(Star):
                     f"对话热度: {_heat_label}({_heat_val:.2f}) → 下次触发延迟约 {_next_delay:.0f} 分钟"
                 )
                 debug_info.append(
-                    f"热度窗口: {int(_window_m)} 分钟，满热约需 {_full_score_messages:.0f} 条消息，记录消息数: {len(st_debug.msg_timestamps or [])}"
+                    "热度窗口: "
+                    f"短期 {int(_short_window_m)} 分钟（权重 {_short_weight:.0%}），"
+                    f"长期 {int(_long_window_m)} 分钟，满热约需 "
+                    f"{_full_score_messages:.0f} 条消息，记录消息数: "
+                    f"{len(st_debug.msg_timestamps or [])}"
                 )
             elif not heat_enabled:
                 debug_info.append("对话热度: 已关闭（使用固定 idle_after_minutes）")
@@ -1773,7 +1796,9 @@ class Spark(Star):
 
         heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
         if heat_enabled:
-            window_m, _full_score_messages = self._get_heat_args()
+            short_window_m, long_window_m, _full_score_messages, short_weight = (
+                self._get_heat_args()
+            )
             now_ts = now.timestamp()
             heat_val = self._calc_heat(st, now_ts) if st else 0.0
             if heat_val >= 0.6:
@@ -1782,14 +1807,17 @@ class Spark(Star):
                 heat_label = "温"
             else:
                 heat_label = "冷"
-            window_sec = float(window_m) * 60.0
+            window_sec = float(short_window_m) * 60.0
             recent_msg_count = 0
             if st and st.msg_timestamps:
                 recent_msg_count = sum(
                     1 for ts in st.msg_timestamps if 0 <= now_ts - ts <= window_sec
                 )
             lines.append(
-                f"当前热度: {heat_label}({heat_val:.2f})，{int(window_m)}分钟内 {recent_msg_count} 条消息"
+                "当前热度: "
+                f"{heat_label}({heat_val:.2f})，短期 {int(short_window_m)} 分钟内 "
+                f"{recent_msg_count} 条消息；长期余温 {int(long_window_m)} 分钟，"
+                f"短期权重 {short_weight:.0%}"
             )
         else:
             lines.append("当前热度: 已关闭（使用固定沉寂延迟）")
@@ -2009,6 +2037,9 @@ class Spark(Star):
             if not st:
                 logger.debug("[Spark] 对话增强跳过: 无 SessionState")
                 return False
+            if st.last_proactive_reply_ts > st.last_user_reply_ts:
+                logger.debug("[Spark] 对话增强跳过: 用户尚未回应上次主动消息")
+                return False
 
             roll = random.random() * 100
             triggered = roll < base_prob
@@ -2028,28 +2059,36 @@ class Spark(Star):
             return False
 
     def _schedule_enhancement(self, umo: str, current_round: Optional[dict] = None):
-        """调度一个延迟的对话增强任务"""
-        min_delay = self._get_int_cfg("enhancement", "enhancement_min_delay", 30)
-        max_delay = min(
-            self._get_int_cfg("enhancement", "enhancement_max_delay", 1800), 1800
+        """Schedule one heat-scaled follow-up and leave send/no-send to the judge."""
+        hot_delay = self._get_cfg("enhancement", "enhancement_hot_delay_seconds", None)
+        cold_delay = self._get_cfg(
+            "enhancement", "enhancement_cold_delay_seconds", None
         )
-        min_delay = max(min_delay, 0)
-        max_delay = max(max_delay, 0)
-        if min_delay > max_delay:
-            min_delay = max_delay
-        delay = random.randint(min_delay, max_delay)
+        hot_delay = (
+            int(hot_delay)
+            if hot_delay not in (None, "")
+            else self._get_int_cfg("enhancement", "enhancement_min_delay", 45)
+        )
+        cold_delay = (
+            int(cold_delay)
+            if cold_delay not in (None, "")
+            else self._get_int_cfg("enhancement", "enhancement_max_delay", 600)
+        )
+        st = self._states.get(umo)
+        now_ts = _now_tz(
+            self._get_cfg("basic_settings", "timezone") or None
+        ).timestamp()
+        heat = self._calc_heat(st, now_ts) if st else 0.0
+        delay = heat_scaled_delay_seconds(hot_delay, cold_delay, heat)
 
         gen = self._enhancement_gen.get(umo, 0)
-        logger.info(f"[Spark] 已调度对话增强: {umo}, {delay}秒后执行")
+        logger.info(f"[Spark] 已调度对话增强: {umo}, heat={heat:.2f}, {delay}秒后执行")
         task = asyncio.create_task(
             self._delayed_enhancement(umo, delay, gen, current_round=current_round)
         )
         self._enhancement_tasks[umo] = task
-        st = self._states.get(umo)
         if st:
-            import time as _time
-
-            st.next_enhancement_ts = _time.time() + delay
+            st.next_enhancement_ts = now_ts + delay
 
     async def _delayed_enhancement(
         self,
@@ -2545,6 +2584,12 @@ class Spark(Star):
                 return  # 本次不触发，等下次检查
 
         if now.timestamp() < st.next_idle_ts:
+            return
+
+        if st.last_proactive_reply_ts > st.last_user_reply_ts:
+            st.next_idle_ts = 0.0
+            logger.info(f"[Spark] 沉寂问候跳过: {umo} (用户尚未回应上次主动消息)")
+            await self._debounced_save_session_data()
             return
 
         cooldown_minutes = max(
