@@ -8,15 +8,8 @@ from core.time_policy import (
     choose_offset_minutes,
     cooldown_deadline,
     migrate_compact_policy_values,
-    parse_occurrences,
     parse_policy,
 )
-
-
-def test_parse_occurrences_supports_compact_and_list_formats():
-    assert parse_occurrences("") is None
-    assert parse_occurrences("123") == {1, 2, 3}
-    assert parse_occurrences("1, 2, 10") == {1, 2, 10}
 
 
 def test_legacy_jitter_maps_to_random_both():

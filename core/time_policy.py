@@ -181,15 +181,3 @@ def cooldown_deadline(latest_activity_ts: float, cooldown_minutes: int) -> float
     if latest_activity_ts <= 0 or cooldown_minutes <= 0:
         return 0.0
     return latest_activity_ts + cooldown_minutes * 60
-
-
-def parse_occurrences(value: object) -> set[int] | None:
-    """Return selected one-based matches; None means all occurrences."""
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if re.fullmatch(r"\d+", text):
-        values = [int(char) for char in text if char != "0"]
-    else:
-        values = [int(match) for match in re.findall(r"\d+", text) if int(match) > 0]
-    return set(values)

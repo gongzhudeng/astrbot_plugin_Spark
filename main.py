@@ -7,7 +7,6 @@ import random
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Dict, List, Optional, Tuple
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -16,6 +15,21 @@ from astrbot.api.star import Context, Star, register
 from .core.daily_projection import (
     project_activity_candidates,
     select_highest_priority,
+)
+from .core.daily_task_state import (
+    DAILY_STATE_SCHEMA_VERSION,
+    DailyTaskState,
+    begin_attempt,
+    legacy_daily_state,
+    new_task_state,
+    normalize_daily_states,
+    normalize_success_times,
+    plan_task,
+    record_success_time,
+    store_daily_state,
+    success_interval_deadline,
+    technical_failure,
+    terminal_state,
 )
 from .core.heat_policy import (
     dual_scale_heat,
@@ -29,6 +43,18 @@ from .core.history_content import (
     find_datetime_reminder,
 )
 from .core.message_input import is_slash_prefixed_message
+from .core.proactive_delivery import (
+    DIRECT_DELIVERY_KIND_EXTRA,
+    DIRECT_DELIVERY_TEXT_EXTRA,
+    AgentDeliveryResult,
+    resolve_agent_delivery,
+)
+from .core.proactive_evidence import (
+    EVIDENCE_SCHEMA_VERSION,
+    acknowledge_pending_evidence,
+    normalize_evidence_records,
+    record_proactive_delivery,
+)
 from .core.provider_fallback import (
     ASTRBOT_FALLBACK_MODE,
     dedupe_provider_chain,
@@ -41,9 +67,10 @@ from .core.time_policy import (
     apply_delay_policy,
     cooldown_deadline,
     migrate_compact_policy_values,
-    parse_occurrences,
     parse_policy,
 )
+
+SESSION_DATA_SCHEMA_VERSION = 3
 
 # 尝试导入 StarTools（如果可用）
 try:
@@ -80,20 +107,29 @@ except ImportError:
 
     HAS_LLM_TOOL = False
 
-# 导入官方 Agent Pipeline API（用于主动回复走合规调用）
+# Request-hook APIs are useful even when the full Agent Pipeline is unavailable.
 try:
-    from astrbot.core.astr_main_agent import (
-        build_main_agent,
-        build_main_agent_config,
-    )
     from astrbot.core.cron.events import CronMessageEvent
     from astrbot.core.pipeline.context import call_event_hook
     from astrbot.core.platform.message_session import MessageSession
     from astrbot.core.provider.entities import ProviderRequest
     from astrbot.core.star.star_handler import EventType
 
-    HAS_AGENT_PIPELINE = True
-    AGENT_PIPELINE_IMPORT_ERROR = ""
+    HAS_REQUEST_HOOKS = True
+    REQUEST_HOOK_IMPORT_ERROR = ""
+except ImportError as exc:
+    HAS_REQUEST_HOOKS = False
+    REQUEST_HOOK_IMPORT_ERROR = repr(exc)
+
+# Import the full Agent Pipeline separately so the legacy provider path can still use hooks.
+try:
+    from astrbot.core.astr_main_agent import (
+        build_main_agent,
+        build_main_agent_config,
+    )
+
+    HAS_AGENT_PIPELINE = HAS_REQUEST_HOOKS
+    AGENT_PIPELINE_IMPORT_ERROR = "" if HAS_REQUEST_HOOKS else REQUEST_HOOK_IMPORT_ERROR
 except ImportError as exc:
     HAS_AGENT_PIPELINE = False
     AGENT_PIPELINE_IMPORT_ERROR = repr(exc)
@@ -155,7 +191,7 @@ def _compute_heat(
     )
 
 
-def _parse_hhmm(s: str) -> Optional[Tuple[int, int]]:
+def _parse_hhmm(s: str) -> tuple[int, int] | None:
     """解析 HH:MM 格式时间字符串，返回 (小时, 分钟) 或 None"""
     if not s:
         return None
@@ -219,6 +255,23 @@ def _format_time_delta(seconds: float) -> str:
         return f"{minutes}分钟"
 
 
+class _SafeTemplateValues(dict[str, object]):
+    """Keep unknown legacy placeholders visible instead of dropping the prompt."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def _format_template(template: str, values: dict[str, object]) -> str:
+    try:
+        return template.format_map(_SafeTemplateValues(values))
+    except (AttributeError, IndexError, KeyError, ValueError):
+        rendered = template
+        for key, value in values.items():
+            rendered = rendered.replace("{" + key + "}", str(value))
+        return rendered
+
+
 # 数据类定义
 @dataclass
 class UserProfile:
@@ -263,7 +316,12 @@ class SessionState:
     last_ts: float = 0.0
     last_fired_tag: str = ""  # 保留用于向后兼容
     last_fired_tags: dict = None  # 改为字典：{tag: timestamp}，支持过期清理
-    daily_task_results: dict = None  # {tag: sent|cooldown_skipped}
+    daily_task_results: dict = (
+        None  # Legacy terminal outcomes for one compatibility cycle
+    )
+    daily_task_state_schema_version: int = DAILY_STATE_SCHEMA_VERSION
+    daily_task_states: dict = None
+    daily_greeting_success_times: dict = None
     last_user_reply_ts: float = 0.0
     consecutive_no_reply_count: int = 0
     next_idle_ts: float = 0.0
@@ -276,6 +334,8 @@ class SessionState:
     proactive_recent_messages: list = (
         None  # Deprecated; kept only for old session data compatibility
     )
+    proactive_evidence_schema_version: int = EVIDENCE_SCHEMA_VERSION
+    proactive_evidence: list = None
     next_enhancement_ts: float = (
         0.0  # scheduled enhancement fire time (runtime only, not persisted)
     )
@@ -284,15 +344,25 @@ class SessionState:
         """初始化后处理"""
         if self.last_fired_tags is None:
             self.last_fired_tags = {}
-            # 迁移旧数据
-            if self.last_fired_tag:
-                self.last_fired_tags[self.last_fired_tag] = _now_tz(None).timestamp()
+        if self.last_fired_tag and self.last_fired_tag not in self.last_fired_tags:
+            self.last_fired_tags[self.last_fired_tag] = _now_tz(None).timestamp()
         if self.daily_task_results is None:
             self.daily_task_results = {}
+        self.daily_task_state_schema_version = DAILY_STATE_SCHEMA_VERSION
+        self.daily_task_states = normalize_daily_states(
+            self.daily_task_states,
+            legacy_results=self.daily_task_results,
+            last_fired_tags=self.last_fired_tags,
+        )
+        self.daily_greeting_success_times = normalize_success_times(
+            self.daily_greeting_success_times
+        )
         if self.msg_timestamps is None:
             self.msg_timestamps = []
         if self.proactive_recent_messages is None:
             self.proactive_recent_messages = []
+        self.proactive_evidence_schema_version = EVIDENCE_SCHEMA_VERSION
+        self.proactive_evidence = normalize_evidence_records(self.proactive_evidence)
 
     def to_dict(self):
         return {
@@ -302,6 +372,11 @@ class SessionState:
             "daily_task_results": self.daily_task_results
             if self.daily_task_results
             else {},
+            "daily_task_state_schema_version": self.daily_task_state_schema_version,
+            "daily_task_states": normalize_daily_states(self.daily_task_states),
+            "daily_greeting_success_times": normalize_success_times(
+                self.daily_greeting_success_times
+            ),
             "last_user_reply_ts": self.last_user_reply_ts,
             "consecutive_no_reply_count": self.consecutive_no_reply_count,
             "next_idle_ts": self.next_idle_ts,
@@ -309,6 +384,8 @@ class SessionState:
             "last_proactive_reply_ts": self.last_proactive_reply_ts,
             "last_ai_reply_ts": self.last_ai_reply_ts,
             "msg_timestamps": self.msg_timestamps if self.msg_timestamps else [],
+            "proactive_evidence_schema_version": self.proactive_evidence_schema_version,
+            "proactive_evidence": normalize_evidence_records(self.proactive_evidence),
         }
 
     @classmethod
@@ -329,6 +406,11 @@ class SessionState:
             last_fired_tag=data.get("last_fired_tag", ""),
             last_fired_tags=tags_dict,
             daily_task_results=task_results,
+            daily_task_state_schema_version=data.get(
+                "daily_task_state_schema_version", DAILY_STATE_SCHEMA_VERSION
+            ),
+            daily_task_states=data.get("daily_task_states", {}),
+            daily_greeting_success_times=data.get("daily_greeting_success_times", {}),
             last_user_reply_ts=data.get("last_user_reply_ts", 0.0),
             consecutive_no_reply_count=data.get("consecutive_no_reply_count", 0),
             next_idle_ts=data.get("next_idle_ts", 0.0),
@@ -337,6 +419,12 @@ class SessionState:
             last_ai_reply_ts=data.get("last_ai_reply_ts", 0.0),
             msg_timestamps=msg_ts,
             proactive_recent_messages=proactive_recent,
+            proactive_evidence_schema_version=data.get(
+                "proactive_evidence_schema_version", EVIDENCE_SCHEMA_VERSION
+            ),
+            proactive_evidence=normalize_evidence_records(
+                data.get("proactive_evidence", [])
+            ),
         )
 
     def has_fired(self, tag: str) -> bool:
@@ -361,10 +449,36 @@ class SessionState:
         for t in expired_tags:
             del self.last_fired_tags[t]
 
-    def mark_daily_result(self, tag: str, result: str):
-        """Persist the outcome of a concrete daily greeting task."""
-        self.mark_fired(tag)
-        self.daily_task_results[tag] = result
+    def daily_state(self, task: DailyGreetingTask) -> DailyTaskState:
+        raw = self.daily_task_states.get(task.tag, {})
+        state = (
+            DailyTaskState.from_dict(raw, tag=task.tag)
+            if isinstance(raw, dict) and raw
+            else None
+        )
+        if state is not None:
+            return state
+        if self.has_fired(task.tag):
+            return legacy_daily_state(
+                task.tag,
+                self.daily_task_results.get(task.tag),
+                fired_at=self.last_fired_tags.get(task.tag, 0.0),
+            )
+        return new_task_state(
+            task.tag,
+            target_at=task.target.timestamp(),
+            source_date=task.source_date.isoformat(),
+        )
+
+    def set_daily_state(self, state: DailyTaskState) -> None:
+        self.daily_task_states = store_daily_state(self.daily_task_states, state)
+        if not state.terminal:
+            return
+        legacy_result = {
+            "skipped_cooldown": "cooldown_skipped",
+        }.get(state.status, state.status)
+        self.mark_fired(state.tag)
+        self.daily_task_results[state.tag] = legacy_result
         active_tags = set(self.last_fired_tags)
         self.daily_task_results = {
             task_tag: task_result
@@ -372,15 +486,22 @@ class SessionState:
             if task_tag in active_tags
         }
 
+    def mark_daily_result(self, tag: str, result: str):
+        """Persist a legacy terminal outcome for compatibility callers."""
+        self.set_daily_state(legacy_daily_state(tag, result))
+
 
 @dataclass(frozen=True)
 class DailyGreetingTask:
     slot_num: int
+    greeting_id: str
     target: datetime
     tag: str
     prompt: object
     ignore_dnd: bool
+    ignore_judge: bool
     cooldown_minutes: int
+    activity_trigger_interval_minutes: int
     source_date: date
     source_type: str = "fixed"
     activity: str = ""
@@ -442,7 +563,7 @@ class Reminder:
     "astrbot_plugin_Spark",
     "灵犀 · 主动对话",
     "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候",
-    "2.4.0",
+    "2.5.2",
     "https://github.com/gongzhudeng/astrbot_plugin_Spark",
 )
 class Spark(Star):
@@ -450,23 +571,23 @@ class Spark(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.cfg: AstrBotConfig = config
-        self._loop_task: Optional[asyncio.Task] = None
+        self._loop_task: asyncio.Task | None = None
         self._stopped: bool = False  # 插件停止标志
 
         # 运行时数据
-        self._states: Dict[str, SessionState] = {}
-        self._user_profiles: Dict[str, UserProfile] = {}
-        self._reminders: Dict[str, Reminder] = {}
+        self._states: dict[str, SessionState] = {}
+        self._user_profiles: dict[str, UserProfile] = {}
+        self._reminders: dict[str, Reminder] = {}
         self._timeline_warning_at: float = 0.0
 
         # 文件保存去抖相关
-        self._save_user_data_task: Optional[asyncio.Task] = None
-        self._save_session_data_task: Optional[asyncio.Task] = None
+        self._save_user_data_task: asyncio.Task | None = None
+        self._save_session_data_task: asyncio.Task | None = None
         self._save_delay_seconds = 2.0  # 去抖延迟：2秒
 
         # 对话增强相关
-        self._enhancement_tasks: Dict[str, asyncio.Task] = {}
-        self._enhancement_gen: Dict[str, int] = {}  # generation counter per umo
+        self._enhancement_tasks: dict[str, asyncio.Task] = {}
+        self._enhancement_gen: dict[str, int] = {}  # generation counter per umo
         self._heat_event_marker = "_spark_heat_counted"
 
         # 数据文件路径（使用规范的方式获取插件数据目录）
@@ -515,6 +636,7 @@ class Spark(Star):
         self._sync_subscribed_users_from_config()
         self._migrate_config()
         self._migrate_daily_greetings()
+        self._migrate_daily_greeting_controls()
         self._migrate_compact_time_policy_values()
 
     def _migrate_compact_time_policy_values(self):
@@ -575,6 +697,43 @@ class Spark(Star):
                 )
         except Exception as e:
             logger.warning(f"[Spark] 每日问候配置迁移失败: {e}")
+
+    def _migrate_daily_greeting_controls(self):
+        """Migrate legacy per-greeting controls without changing delivery behavior."""
+        try:
+            daily = self.cfg.get("daily_prompts") or {}
+            greetings = (
+                daily.get("daily_greetings") if isinstance(daily, dict) else None
+            )
+            if not isinstance(greetings, list):
+                return
+            changed = False
+            legacy_occurrences_key = "activity_" + "occurrences"
+            for greeting in greetings:
+                if not isinstance(greeting, dict):
+                    continue
+                if "ignore_judge" not in greeting:
+                    greeting["ignore_judge"] = True
+                    changed = True
+                if (
+                    greeting.get("trigger_source", "固定时间")
+                    in {
+                        "activity",
+                        "日程活动",
+                    }
+                    and "activity_trigger_interval_minutes" not in greeting
+                ):
+                    greeting["activity_trigger_interval_minutes"] = 0
+                    changed = True
+                if legacy_occurrences_key in greeting:
+                    greeting.pop(legacy_occurrences_key, None)
+                    changed = True
+            if changed:
+                self.cfg["daily_prompts"] = daily
+                self.cfg.save_config()
+                logger.info("[Spark] 已迁移每日问候判断开关与活动触发间隔配置")
+        except Exception as e:
+            logger.warning(f"[Spark] 每日问候控制配置迁移失败: {e}")
 
     def _migrate_config(self):
         """One-time config migration: old locations -> new locations"""
@@ -732,6 +891,7 @@ class Spark(Star):
 
     async def initialize(self):
         """插件激活时的初始化方法（框架生命周期）"""
+        self.context._spark_get_proactive_state = self._get_proactive_state
         # 启动后台调度器
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[Spark] Scheduler started.")
@@ -757,6 +917,67 @@ class Spark(Star):
         if not isinstance(group, dict):
             return default
         return group.get(sub_key, default)
+
+    def _get_proactive_state(self, session_id: str) -> dict:
+        """Expose a bounded, read-only delivery/reply snapshot to collaborating plugins."""
+        state = self._states.get(str(session_id))
+        if state is None:
+            return {
+                "session_id": str(session_id),
+                "available": False,
+                "schema_version": EVIDENCE_SCHEMA_VERSION,
+                "evidence": [],
+                "last_proactive_reply_ts": 0.0,
+                "last_user_reply_ts": 0.0,
+                "awaiting_user_reply": False,
+            }
+        proactive_ts = max(
+            0.0, float(getattr(state, "last_proactive_reply_ts", 0.0) or 0.0)
+        )
+        user_ts = max(0.0, float(getattr(state, "last_user_reply_ts", 0.0) or 0.0))
+        evidence = normalize_evidence_records(getattr(state, "proactive_evidence", []))
+        return {
+            "session_id": str(session_id),
+            "available": True,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "evidence": [dict(item) for item in evidence],
+            "last_proactive_reply_ts": proactive_ts,
+            "last_user_reply_ts": user_ts,
+            "awaiting_user_reply": any(
+                item["reply_status"] == "pending" for item in evidence
+            )
+            or proactive_ts > user_ts,
+        }
+
+    @staticmethod
+    def _acknowledge_proactive_evidence(
+        state: SessionState, *, reply_at: float, reply_text: object
+    ) -> list[str]:
+        state.proactive_evidence, acknowledged = acknowledge_pending_evidence(
+            state.proactive_evidence,
+            reply_at=reply_at,
+            reply_text=reply_text,
+        )
+        return acknowledged
+
+    def _record_proactive_delivery(
+        self,
+        umo: str,
+        *,
+        source: str,
+        sent_at: float,
+        response_text: object,
+    ) -> dict:
+        state = self._states.setdefault(umo, SessionState())
+        state.proactive_evidence, record = record_proactive_delivery(
+            state.proactive_evidence,
+            source=source,
+            sent_at=sent_at,
+            proactive_text=response_text,
+        )
+        state.last_ts = sent_at
+        state.last_proactive_reply_ts = sent_at
+        return record
 
     def _get_int_cfg(self, group_key: str, sub_key: str, default: int) -> int:
         value = self._get_cfg(group_key, sub_key, None)
@@ -788,7 +1009,7 @@ class Spark(Star):
             min(max(short_weight, 0.0), 1.0),
         )
 
-    def _calc_heat(self, st: "SessionState", now_ts: float) -> float:
+    def _calc_heat(self, st: SessionState, now_ts: float) -> float:
         short_window_m, long_window_m, full_score_messages, short_weight = (
             self._get_heat_args()
         )
@@ -802,7 +1023,7 @@ class Spark(Star):
         )
 
     def _calc_idle_delay(
-        self, st: "SessionState", now_ts: float, profile: "UserProfile"
+        self, st: SessionState, now_ts: float, profile: UserProfile
     ) -> float:
         """Return the base idle-greeting delay in minutes, applying heat scaling when enabled.
 
@@ -826,7 +1047,7 @@ class Spark(Star):
         return float(self._get_cfg("idle_greetings", "idle_after_minutes", 45) or 45)
 
     def _calc_fluctuated_idle_delay(
-        self, st: "SessionState", now_ts: float, profile: "UserProfile"
+        self, st: SessionState, now_ts: float, profile: UserProfile
     ) -> float | None:
         """Apply the configured time policy to the heat/fixed idle baseline."""
         delay_m = self._calc_idle_delay(st, now_ts, profile)
@@ -875,7 +1096,7 @@ class Spark(Star):
         if not os.path.exists(self._user_data_path):
             return
         try:
-            with open(self._user_data_path, "r", encoding="utf-8") as f:
+            with open(self._user_data_path, encoding="utf-8") as f:
                 data = json.load(f)
 
                 profiles_data = data.get("profiles", {})
@@ -892,7 +1113,7 @@ class Spark(Star):
 
         except (json.JSONDecodeError, TypeError) as e:
             logger.error(f"[Spark] Failed to load user data: {e}")
-        except (IOError, OSError) as e:
+        except OSError as e:
             logger.error(f"[Spark] Failed to read user data file: {e}")
 
     def _save_user_data(self):
@@ -907,7 +1128,7 @@ class Spark(Star):
             data = {"profiles": profiles_dict, "reminders": reminders_dict}
             with open(self._user_data_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
-        except (IOError, OSError) as e:
+        except OSError as e:
             logger.error(f"[Spark] Failed to write user data file: {e}")
         except (TypeError, ValueError) as e:
             logger.error(f"[Spark] Failed to serialize user data: {e}")
@@ -917,7 +1138,7 @@ class Spark(Star):
         if not os.path.exists(self._session_data_path):
             return
         try:
-            with open(self._session_data_path, "r", encoding="utf-8") as f:
+            with open(self._session_data_path, encoding="utf-8") as f:
                 data = json.load(f)
 
                 states_data = data.get("states", {})
@@ -927,17 +1148,20 @@ class Spark(Star):
 
         except (json.JSONDecodeError, TypeError) as e:
             logger.error(f"[Spark] Failed to load session data: {e}")
-        except (IOError, OSError) as e:
+        except OSError as e:
             logger.error(f"[Spark] Failed to read session data file: {e}")
 
     def _save_session_data(self):
         """保存运行时状态（到 session_data.json）"""
         try:
             states_dict = {cid: state.to_dict() for cid, state in self._states.items()}
-            data = {"states": states_dict}
+            data = {
+                "schema_version": SESSION_DATA_SCHEMA_VERSION,
+                "states": states_dict,
+            }
             with open(self._session_data_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
-        except (IOError, OSError) as e:
+        except OSError as e:
             logger.error(f"[Spark] Failed to write session data file: {e}")
         except (TypeError, ValueError) as e:
             logger.error(f"[Spark] Failed to serialize session data: {e}")
@@ -1070,7 +1294,7 @@ class Spark(Star):
 
     # 事件处理
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=30)
     async def _on_any_message(self, event: AstrMessageEvent):
         """
         监听所有消息事件
@@ -1117,6 +1341,15 @@ class Spark(Star):
         if is_real_message:
             st.last_ts = now_ts
             st.last_user_reply_ts = now_ts
+            acknowledged = self._acknowledge_proactive_evidence(
+                st,
+                reply_at=now_ts,
+                reply_text=message_text,
+            )
+            if acknowledged:
+                logger.debug(
+                    f"[Spark] 主动证据记录首次用户回复: {umo}, count={len(acknowledged)}"
+                )
             if not event.get_extra(self._heat_event_marker, False):
                 if st.msg_timestamps is None:
                     st.msg_timestamps = []
@@ -1198,6 +1431,16 @@ class Spark(Star):
                 self._get_cfg("basic_settings", "timezone") or None
             ).timestamp()
             st.last_user_reply_ts = now_ts
+            acknowledged = self._acknowledge_proactive_evidence(
+                st,
+                reply_at=now_ts,
+                reply_text=str(getattr(event, "message_str", "") or ""),
+            )
+            if acknowledged:
+                logger.debug(
+                    f"[Spark] 主动证据在 LLM 请求补偿入口记录回复: "
+                    f"{umo}, count={len(acknowledged)}"
+                )
             if st.msg_timestamps is None:
                 st.msg_timestamps = []
             st.msg_timestamps.append(now_ts)
@@ -1852,28 +2095,58 @@ class Spark(Star):
                 )
 
         projection = self._parse_daily_slots(now)
-        today_tasks = [
-            task for task in projection.tasks if task.source_date == now.date()
+        visible_tasks = [
+            task
+            for task in projection.tasks
+            if task.source_date == now.date()
+            or task.target.date() == now.date()
+            or (
+                st
+                and (raw := st.daily_task_states.get(task.tag))
+                and isinstance(raw, dict)
+                and raw.get("status") == "retrying"
+            )
         ]
-        today_tasks.sort(key=lambda t: t.target)
-        today_issues = [
+        visible_tasks.sort(key=lambda task: task.target)
+        visible_issues = [
             issue for issue in projection.issues if issue.source_date == now.date()
         ]
-        if today_tasks or today_issues:
-            lines.append("今日日程问候:")
+        if visible_tasks or visible_issues:
+            lines.append("相关每日问候:")
 
-        for task in today_tasks:
-            result = st.daily_task_results.get(task.tag, "") if st else ""
-            if result == "sent":
-                status = "已发送"
-            elif result == "cooldown_skipped":
-                status = "冷却跳过"
-            elif st and st.has_fired(task.tag):
-                status = "已处理"
-            elif task.target < now.replace(second=0, microsecond=0):
-                status = "已错过"
+        daily_status_labels = {
+            "sent": "已发送",
+            "skipped_cooldown": "聊天冷却跳过",
+            "skipped_dnd": "免打扰跳过",
+            "skipped_busy": "忙碌跳过",
+            "skipped_judge": "智能判断跳过",
+            "skipped_interval": "同问候间隔跳过",
+            "failed": "技术失败终止",
+            "missed": "已错过",
+            "legacy_processed": "已处理",
+            "sending": "发送状态待确认",
+        }
+        for task in visible_tasks:
+            state = (
+                st.daily_state(task)
+                if st
+                else new_task_state(
+                    task.tag,
+                    target_at=task.target.timestamp(),
+                    source_date=task.source_date.isoformat(),
+                )
+            )
+            if state.status == "retrying":
+                retry_at = datetime.fromtimestamp(state.next_retry_at, tz=now.tzinfo)
+                status = f"技术失败，{retry_at.strftime('%H:%M:%S')} 重试"
+                pending.append(
+                    (
+                        max(0.0, state.next_retry_at - now.timestamp()),
+                        f"  每日问候重试 → {retry_at.strftime('%H:%M:%S')}",
+                    )
+                )
             else:
-                status = "待触发"
+                status = daily_status_labels.get(state.status, "待触发")
 
             # Use a meaningful label instead of a sequence number
             if task.source_type == "activity" and task.activity:
@@ -1885,8 +2158,8 @@ class Spark(Star):
                 boundary_label = "开始" if task.boundary == "start" else "结束"
                 base_text = task.base.strftime("%m-%d %H:%M") if task.base else "未知"
                 lines.append(
-                    f"  {source}: 第{task.occurrence}次 {task.activity} | "
-                    f"{boundary_label} {base_text} -> {task.target.strftime('%m-%d %H:%M')} | {status}"
+                    f"  {source}: {boundary_label} {base_text} -> "
+                    f"{task.target.strftime('%m-%d %H:%M')} | {status}"
                 )
             else:
                 lines.append(
@@ -1918,11 +2191,9 @@ class Spark(Star):
             "no_keywords": "未配置关键词",
             "invalid_time": "固定时间无效",
         }
-        for issue in today_issues:
+        for issue in visible_issues:
             label = issue_labels.get(issue.status, issue.status)
-            activity = (
-                f"第{issue.occurrence}次 {issue.activity} | " if issue.activity else ""
-            )
+            activity = f"{issue.activity} | " if issue.activity else ""
             lines.append(
                 f"  每日问候 {issue.slot_num + 1}: {activity}{label}（{issue.detail}）"
             )
@@ -1967,7 +2238,7 @@ class Spark(Star):
             "/灵犀 帮助 - 显示本帮助"
         )
 
-    def _get_user_reminders_sorted(self, umo: str) -> List[Reminder]:
+    def _get_user_reminders_sorted(self, umo: str) -> list[Reminder]:
         """获取指定用户的提醒列表并排序"""
         arr = [r for r in self._reminders.values() if r.umo == umo]
         arr.sort(key=lambda x: x.created_at)
@@ -2058,7 +2329,7 @@ class Spark(Star):
             logger.error(f"[Spark] 对话增强判断出错: {e}")
             return False
 
-    def _schedule_enhancement(self, umo: str, current_round: Optional[dict] = None):
+    def _schedule_enhancement(self, umo: str, current_round: dict | None = None):
         """Schedule one heat-scaled follow-up and leave send/no-send to the judge."""
         hot_delay = self._get_cfg("enhancement", "enhancement_hot_delay_seconds", None)
         cold_delay = self._get_cfg(
@@ -2095,7 +2366,7 @@ class Spark(Star):
         umo: str,
         delay: int,
         gen: int,
-        current_round: Optional[dict] = None,
+        current_round: dict | None = None,
     ):
         """延迟执行对话增强回复"""
         try:
@@ -2168,6 +2439,7 @@ class Spark(Star):
                 tz,
                 prompt_template,
                 judge_current_round=current_round,
+                source="conversation_enhancement",
             )
             if ok:
                 logger.info(f"[Spark] 对话增强回复成功: {umo}")
@@ -2308,19 +2580,28 @@ class Spark(Star):
         boundary: str = "",
     ) -> DailyGreetingTask:
         policy = parse_policy(item, legacy_jitter_key="jitter_minutes")
-        seed = f"daily:{source_date.isoformat()}:{slot_num}:{occurrence}"
+        configured_task_id = re.sub(
+            r"[^A-Za-z0-9_.-]+", "_", str(item.get("task_id") or "").strip()
+        )[:64]
+        task_identity = configured_task_id or str(slot_num)
+        seed = f"daily:{source_date.isoformat()}:{task_identity}:{occurrence}"
         target = apply_datetime_policy(base, policy, seed=seed)
         tag = (
-            f"daily_{slot_num}_{occurrence}@{source_date.isoformat()}"
+            f"daily_{task_identity}_{occurrence}@{source_date.isoformat()}"
             f"->{target.strftime('%Y-%m-%d %H:%M')}"
         )
         return DailyGreetingTask(
             slot_num=slot_num,
+            greeting_id=task_identity,
             target=target,
             tag=tag,
             prompt=item.get("prompt", ""),
             ignore_dnd=bool(item.get("ignore_dnd", False)),
+            ignore_judge=bool(item.get("ignore_judge", False)),
             cooldown_minutes=max(0, int(item.get("cooldown_minutes", 0) or 0)),
+            activity_trigger_interval_minutes=max(
+                0, int(item.get("activity_trigger_interval_minutes", 0) or 0)
+            ),
             source_date=source_date,
             source_type=source_type,
             activity=activity,
@@ -2399,12 +2680,9 @@ class Spark(Star):
                 ],
             )
 
-        selected = parse_occurrences(item.get("activity_occurrences"))
         boundary_value = str(item.get("activity_boundary", "活动开始") or "活动开始")
         boundary = "end" if boundary_value in {"end", "活动结束"} else "start"
-        candidate_projection = project_activity_candidates(
-            timeline, keywords, selected, boundary
-        )
+        candidate_projection = project_activity_candidates(timeline, keywords, boundary)
         tasks = []
         issues = [
             DailyGreetingIssue(
@@ -2542,9 +2820,9 @@ class Spark(Star):
     async def _check_idle_greeting(
         self,
         umo: str,
-        st: Optional[SessionState],
+        st: SessionState | None,
         now: datetime,
-        tz: Optional[str],
+        tz: str | None,
         reply_interval: int,
     ):
         """检查并触发延时问候"""
@@ -2625,7 +2903,12 @@ class Spark(Star):
 
         prompt_template = random.choice(idle_prompts)
         logger.info(f"[Spark] 触发延时问候 {umo}")
-        ok = await self._proactive_reply(umo, tz, prompt_template)
+        ok = await self._proactive_reply(
+            umo,
+            tz,
+            prompt_template,
+            source="silence_greeting",
+        )
         st.mark_fired(tag)
         if ok:
             st.next_idle_ts = 0.0
@@ -2653,16 +2936,16 @@ class Spark(Star):
     async def _check_daily_greetings(
         self,
         umo: str,
-        st: Optional[SessionState],
+        st: SessionState | None,
         profile: UserProfile,
         now: datetime,
         daily_slots: list[DailyGreetingTask],
-        tz: Optional[str],
+        tz: str | None,
         reply_interval: int,
         is_in_dnd: bool = False,
         is_busy: bool = False,
     ):
-        """Trigger due daily greetings after cooldown and DND gates."""
+        """Execute concrete daily tasks with durable, technical-only retries."""
         if (
             not bool(self.cfg.get("enable_daily_greetings", True))
             or not profile.daily_reminders_enabled
@@ -2671,13 +2954,64 @@ class Spark(Star):
         if not st:
             return
 
-        due_tasks = [
-            task
-            for task in daily_slots
-            if task.target.strftime("%Y-%m-%d %H:%M") == now.strftime("%Y-%m-%d %H:%M")
-        ]
-        for task in due_tasks:
-            if st.has_fired(task.tag):
+        now_ts = now.timestamp()
+        initial_grace_seconds = max(
+            30,
+            self._get_int_cfg("daily_prompts", "initial_trigger_grace_seconds", 90),
+        )
+        retry_window_seconds = max(
+            60,
+            self._get_int_cfg("daily_prompts", "technical_retry_window_minutes", 15)
+            * 60,
+        )
+        retry_interval_seconds = max(
+            30,
+            self._get_int_cfg("daily_prompts", "technical_retry_interval_seconds", 60),
+        )
+        max_attempts = max(
+            1,
+            self._get_int_cfg("daily_prompts", "technical_retry_max_attempts", 3),
+        )
+
+        for task in sorted(daily_slots, key=lambda item: item.target):
+            if task.target.timestamp() > now_ts:
+                continue
+            state = st.daily_state(task)
+            decision, planned = plan_task(
+                state,
+                now_ts=now_ts,
+                initial_grace_seconds=initial_grace_seconds,
+                max_attempts=max_attempts,
+            )
+            if planned != state:
+                st.set_daily_state(planned)
+                self._save_session_data()
+            if decision != "attempt":
+                continue
+
+            interval_deadline = (
+                success_interval_deadline(
+                    st.daily_greeting_success_times,
+                    task.greeting_id,
+                    task.activity_trigger_interval_minutes,
+                )
+                if task.source_type == "activity"
+                else 0.0
+            )
+            if interval_deadline and now_ts < interval_deadline:
+                logger.info(
+                    f"[Spark] 每日问候跳过: {umo} "
+                    f"(同问候间隔 {task.activity_trigger_interval_minutes} 分钟)"
+                )
+                st.set_daily_state(
+                    terminal_state(
+                        planned,
+                        "skipped_interval",
+                        now_ts=now_ts,
+                        reason="activity_success_interval",
+                    )
+                )
+                self._save_session_data()
                 continue
 
             latest_chat_ts = max(
@@ -2688,16 +3022,46 @@ class Spark(Star):
             if (
                 task.cooldown_minutes > 0
                 and latest_chat_ts > 0
-                and now.timestamp() - latest_chat_ts < task.cooldown_minutes * 60
+                and now_ts - latest_chat_ts < task.cooldown_minutes * 60
             ):
                 logger.info(
                     f"[Spark] 每日问候跳过: {umo} "
                     f"(聊天冷却 {task.cooldown_minutes} 分钟)"
                 )
-                st.mark_daily_result(task.tag, "cooldown_skipped")
+                st.set_daily_state(
+                    terminal_state(
+                        planned,
+                        "skipped_cooldown",
+                        now_ts=now_ts,
+                        reason="chat_cooldown",
+                    )
+                )
+                self._save_session_data()
                 continue
 
-            if not task.ignore_dnd and (is_in_dnd or is_busy):
+            if not task.ignore_dnd and is_in_dnd:
+                logger.info(f"[Spark] 每日问候跳过: {umo} (免打扰时段)")
+                st.set_daily_state(
+                    terminal_state(
+                        planned,
+                        "skipped_dnd",
+                        now_ts=now_ts,
+                        reason="dnd",
+                    )
+                )
+                self._save_session_data()
+                continue
+            if not task.ignore_dnd and is_busy:
+                logger.info(f"[Spark] 每日问候跳过: {umo} (忙碌时段)")
+                st.set_daily_state(
+                    terminal_state(
+                        planned,
+                        "skipped_busy",
+                        now_ts=now_ts,
+                        reason="busy",
+                    )
+                )
+                self._save_session_data()
                 continue
 
             prompt_raw = task.prompt
@@ -2707,11 +3071,36 @@ class Spark(Star):
                 else prompt_raw
             )
             if not prompt_template:
+                st.set_daily_state(
+                    terminal_state(
+                        planned,
+                        "failed",
+                        now_ts=now_ts,
+                        reason="empty_prompt_config",
+                    )
+                )
+                self._save_session_data()
                 continue
+
+            if not task.ignore_judge:
+                should_send = await self._judge_should_reply(umo, tz)
+                if not should_send:
+                    logger.info(f"[Spark] 每日问候跳过: {umo} (智能判断为否)")
+                    st.set_daily_state(
+                        terminal_state(
+                            planned,
+                            "skipped_judge",
+                            now_ts=now_ts,
+                            reason="judge_rejected",
+                        )
+                    )
+                    self._save_session_data()
+                    continue
 
             logger.info(
                 f"[Spark] 触发每日定时{task.slot_num}回复 {umo} "
-                f"(ignore_dnd={task.ignore_dnd})"
+                f"(ignore_dnd={task.ignore_dnd}, ignore_judge={task.ignore_judge}, "
+                f"attempt={planned.attempts + 1})"
             )
             if task.ignore_dnd and is_busy:
                 flush_delay = int(
@@ -2725,13 +3114,52 @@ class Spark(Star):
                     except Exception as exc:
                         logger.warning(f"[Spark] wake_and_flush 失败: {exc}")
                 await asyncio.sleep(flush_delay)
-            ok = await self._proactive_reply(umo, tz, prompt_template, skip_judge=True)
+
+            sending = begin_attempt(
+                planned,
+                now_ts=now_ts,
+                retry_window_seconds=retry_window_seconds,
+            )
+            st.set_daily_state(sending)
+            self._save_session_data()
+            ok = await self._proactive_reply(
+                umo,
+                tz,
+                prompt_template,
+                skip_judge=True,
+                source="daily_greeting",
+            )
+            delivery_completed_at = _now_tz(tz).timestamp()
             if ok:
-                st.mark_daily_result(task.tag, "sent")
+                st.set_daily_state(
+                    terminal_state(
+                        sending,
+                        "sent",
+                        now_ts=now_ts,
+                        reason="delivered",
+                    )
+                )
+                if task.source_type == "activity":
+                    st.daily_greeting_success_times = record_success_time(
+                        st.daily_greeting_success_times,
+                        task.greeting_id,
+                        delivery_completed_at,
+                    )
+                self._save_session_data()
                 if reply_interval > 0:
                     await asyncio.sleep(reply_interval)
-            else:
-                st.consecutive_no_reply_count += 1
+                continue
+
+            st.consecutive_no_reply_count += 1
+            st.set_daily_state(
+                technical_failure(
+                    sending,
+                    now_ts=now_ts,
+                    max_attempts=max_attempts,
+                    retry_interval_seconds=retry_interval_seconds,
+                )
+            )
+            self._save_session_data()
 
     async def _should_auto_unsubscribe(
         self, umo: str, profile: UserProfile, st: SessionState, now: datetime
@@ -2763,7 +3191,7 @@ class Spark(Star):
         return False
 
     async def _check_reminders(
-        self, now: datetime, tz: Optional[str], reply_interval: int
+        self, now: datetime, tz: str | None, reply_interval: int
     ):
         """检查并触发到期的提醒事项"""
         if not bool(self._get_cfg("reminders_settings", "enable_reminders", True)):
@@ -2939,11 +3367,35 @@ class Spark(Star):
             purpose="生成",
         )
 
+    async def _get_emotion_judge_context(self, umo: str) -> str:
+        callback = getattr(self.context, "_emotion_state_get_prompt_context", None)
+        if not callable(callback):
+            logger.debug(f"[Spark] 判断上下文未包含 Emotion: {umo} (接口不可用)")
+            return ""
+        try:
+            result = callback(umo)
+            result = await result if asyncio.iscoroutine(result) else result
+            context = str(result or "").strip()
+            marker_complete = (
+                "<emotion_state_rules>" in context
+                and "</emotion_state_rules>" in context
+                and "<emotion_state_snapshot>" in context
+                and "</emotion_state_snapshot>" in context
+            )
+            logger.info(
+                f"[Spark] 判断 Emotion 诊断: session={umo}, "
+                f"marker_complete={marker_complete}, chars={len(context)}"
+            )
+            return context
+        except Exception as exc:
+            logger.warning(f"[Spark] 读取 Emotion 判断上下文失败({umo}): {exc}")
+            return ""
+
     async def _judge_should_reply(
         self,
         umo: str,
-        tz: Optional[str],
-        current_round: Optional[dict] = None,
+        tz: str | None,
+        current_round: dict | None = None,
     ) -> bool:
         """Step 1: Lightweight LLM call to decide whether to send a proactive reply."""
         try:
@@ -3046,7 +3498,12 @@ class Spark(Star):
             if not judge_template:
                 judge_template = (
                     "日程：{today_schedule}\n当前活动：{current_activity}\n"
-                    "用户节律：{time_period_prompt}\n距上次聊天：{time_since_last_chat}"
+                    "用户节律：{time_period_prompt}\n内心世界：\n{emotion_state}\n"
+                    "距上次聊天：{time_since_last_chat}"
+                )
+            elif "{emotion_state}" not in judge_template:
+                judge_template = (
+                    f"{judge_template.rstrip()}\n内心世界：\n{{emotion_state}}"
                 )
             judge_rules = (
                 self._get_cfg("proactive_settings", "proactive_judge_rules") or ""
@@ -3066,6 +3523,7 @@ class Spark(Star):
                 if callable(_get_prompt)
                 else getattr(self.context, "_time_period_current_prompt", "")
             )
+            emotion_state = await self._get_emotion_judge_context(umo)
 
             # Compute heat_level label for judge templates
             if st:
@@ -3079,24 +3537,24 @@ class Spark(Star):
             else:
                 heat_level = "冷"
 
-            try:
-                judge_prompt = judge_template.format(
-                    now=now_str,
-                    last_user=last_user,
-                    last_ai=last_ai,
-                    time_since_last_chat=time_since_last_chat,
-                    umo=umo,
-                    today_schedule=today_schedule,
-                    outfit=outfit,
-                    current_activity=current_activity,
-                    next_activity=next_activity,
-                    custom_prompt=custom_prompt,
-                    time_period_prompt=time_period_prompt,
-                    heat_level=heat_level,
-                )
-            except KeyError as e:
-                logger.warning(f"[Spark] Judge prompt format error: {e}")
-                judge_prompt = judge_template
+            judge_prompt = _format_template(
+                judge_template,
+                {
+                    "now": now_str,
+                    "last_user": last_user,
+                    "last_ai": last_ai,
+                    "time_since_last_chat": time_since_last_chat,
+                    "umo": umo,
+                    "today_schedule": today_schedule,
+                    "outfit": outfit,
+                    "current_activity": current_activity,
+                    "next_activity": next_activity,
+                    "custom_prompt": custom_prompt,
+                    "time_period_prompt": time_period_prompt,
+                    "emotion_state": emotion_state,
+                    "heat_level": heat_level,
+                },
+            )
 
             providers = self._get_judge_providers(umo)
             if not providers:
@@ -3283,7 +3741,7 @@ class Spark(Star):
             or "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]"
         )
 
-    def _fallback_datetime_reminder(self, umo: str, tz: Optional[str] = None) -> str:
+    def _fallback_datetime_reminder(self, umo: str, tz: str | None = None) -> str:
         astrbot_config = self.context.get_config(umo=umo)
         provider_settings = astrbot_config.get("provider_settings", {})
         if not provider_settings.get("datetime_system_prompt"):
@@ -3578,11 +4036,12 @@ class Spark(Star):
     async def _proactive_reply(
         self,
         umo: str,
-        tz: Optional[str],
+        tz: str | None,
         prompt_template: str,
         skip_judge: bool = False,
-        judge_current_round: Optional[dict] = None,
+        judge_current_round: dict | None = None,
         slash_triggered: bool = False,
+        source: str = "silence_greeting",
     ) -> bool:
         """
         执行主动回复的核心方法
@@ -3593,7 +4052,8 @@ class Spark(Star):
 
         Args:
             skip_judge: 为 True 时跳过 LLM 判断步骤，必定触发回复（用于每日问候等定时任务）
-            slash_triggered: 为 True 时保留发送和历史，但不更新聊天时间
+            slash_triggered: 为 True 时保留发送和历史，但不更新聊天时间或主动证据
+            source: 自然主动消息来源，用于成功送达后的结构化证据
         """
         try:
             # Step 1: Judge whether to reply (skip for daily greetings etc.)
@@ -3698,7 +4158,7 @@ class Spark(Star):
             gen_persona = await self._get_gen_persona(umo)
 
             if HAS_AGENT_PIPELINE:
-                response_text = await self._run_agent_pipeline(
+                delivery = await self._run_agent_pipeline(
                     umo,
                     prompt,
                     tz,
@@ -3715,14 +4175,30 @@ class Spark(Star):
                 response_text = await self._run_legacy_llm(
                     umo, prompt, provider=gen_provider, persona=gen_persona
                 )
+                delivery = (
+                    AgentDeliveryResult(
+                        response_text=response_text,
+                        history_text=response_text,
+                    )
+                    if response_text
+                    else None
+                )
 
-            if not response_text:
+            if delivery is None:
                 return False
 
-            # Send message (if Agent didn't send via tool)
-            if not getattr(self, "_last_cron_event_sent", False):
-                await self._send_text(umo, response_text)
-            logger.info(f"[Spark] 已发送主动回复给 {umo}: {response_text[:50]}...")
+            if not delivery.already_delivered:
+                if not await self._send_text(umo, delivery.response_text):
+                    return False
+                logger.info(
+                    f"[Spark] 已发送主动回复给 {umo}: {delivery.response_text[:50]}..."
+                )
+            else:
+                logger.info(
+                    f"[Spark] 工具已直接发送主动回复给 {umo}: "
+                    f"kind={delivery.delivery_kind}, "
+                    f"history={delivery.history_text[:50]}..."
+                )
 
             # Save history only for legacy path; agent pipeline saves history in _run_agent_pipeline.
             if not HAS_AGENT_PIPELINE:
@@ -3738,19 +4214,20 @@ class Spark(Star):
                             build_proactive_user_content(
                                 self._proactive_placeholder(), reminder
                             ),
-                            response_text,
+                            delivery.history_text,
                         )
                 except Exception as e:
                     logger.warning(f"[Spark] 保存主动回复历史失败: {e}")
 
-            # Update state only for naturally triggered proactive conversations.
+            # Commit evidence only after the complete message was delivered.
             if not slash_triggered:
-                now_ts = now.timestamp()
-                if umo not in self._states:
-                    self._states[umo] = SessionState()
-                st = self._states[umo]
-                st.last_ts = now_ts
-                st.last_proactive_reply_ts = now_ts
+                sent_at = _now_tz(tz).timestamp()
+                self._record_proactive_delivery(
+                    umo,
+                    source=source,
+                    sent_at=sent_at,
+                    response_text=delivery.history_text,
+                )
                 await self._debounced_save_session_data()
 
             return True
@@ -3940,15 +4417,57 @@ class Spark(Star):
             f"baseline={baseline_len}, cleaned={removed}"
         )
 
+    @staticmethod
+    def _proactive_prompt_diagnostics(req) -> dict[str, object]:
+        system_prompt = str(getattr(req, "system_prompt", "") or "")
+        return {
+            "emotion": "<!-- EMOTION_STATE_BEGIN -->" in system_prompt
+            and "<!-- /EMOTION_STATE_END -->" in system_prompt,
+            "emotion_anchor": "<!-- EMOTION_STATE_ANCHOR -->" in system_prompt,
+            "busy_schedule": "<!-- BUSY_SCHEDULE_CACHE -->" in system_prompt,
+            "system_prompt_chars": len(system_prompt),
+            "extra_user_parts": len(
+                getattr(req, "extra_user_content_parts", None) or []
+            ),
+        }
+
+    async def _apply_proactive_request_hooks(
+        self,
+        event,
+        req,
+        *,
+        umo: str,
+        pipeline: str,
+    ) -> bool:
+        if not HAS_REQUEST_HOOKS:
+            logger.warning(
+                f"[Spark] 主动请求钩子不可用: {umo}, "
+                f"pipeline={pipeline}, import_error={REQUEST_HOOK_IMPORT_ERROR}"
+            )
+            return False
+
+        stopped = await call_event_hook(event, EventType.OnLLMRequestEvent, req)
+        diagnostics = self._proactive_prompt_diagnostics(req)
+        event.set_extra("spark_prompt_diagnostics", diagnostics)
+        logger.info(
+            f"[Spark] 主动请求装配诊断: session={umo}, pipeline={pipeline}, "
+            f"emotion={diagnostics['emotion']}, "
+            f"emotion_anchor={diagnostics['emotion_anchor']}, "
+            f"busy_schedule={diagnostics['busy_schedule']}, "
+            f"system_chars={diagnostics['system_prompt_chars']}, "
+            f"extra_user_parts={diagnostics['extra_user_parts']}, stopped={stopped}"
+        )
+        return stopped
+
     async def _run_agent_pipeline(
         self,
         umo: str,
         prompt: str,
-        tz: Optional[str] = None,
+        tz: str | None = None,
         provider=None,
         persona: str = "",
         slash_triggered: bool = False,
-    ) -> Optional[str]:
+    ) -> AgentDeliveryResult | None:
         """通过官方 CronMessageEvent + build_main_agent 执行 Agent Pipeline"""
         self._last_cron_event_sent = False
 
@@ -4037,7 +4556,12 @@ class Spark(Star):
         cron_event.message_str = generation_prompt
         # hook 期间 req.prompt 保持 retrieval_query（真实聊天+模板指令），供 livingmemory/knowledge_base 做检索
         # 与正常 pipeline 顺序一致：OnLLMRequestEvent 触发后各插件注入记忆/知识库/节律等
-        if await call_event_hook(cron_event, EventType.OnLLMRequestEvent, req):
+        if await self._apply_proactive_request_hooks(
+            cron_event,
+            req,
+            umo=umo,
+            pipeline="agent",
+        ):
             return None
         req.prompt = generation_prompt
 
@@ -4075,20 +4599,15 @@ class Spark(Star):
             pass
 
         llm_resp = runner.get_final_llm_resp()
-        if not llm_resp or not llm_resp.completion_text:
-            logger.debug(f"[Spark] Agent 无文本响应: {umo}")
-            return None
-
-        response_text = llm_resp.completion_text.strip()
-        if not response_text:
-            return None
-
-        # Only suppress Spark's manual text send if the agent/tool already sent the
-        # full response and returned no text (e.g. a tool that sends its own text reply).
-        # Do NOT suppress when a tool only sent an image while the agent still returned text.
-        self._last_cron_event_sent = (
-            getattr(cron_event, "_has_send_oper", False) and not response_text
+        delivery = resolve_agent_delivery(
+            getattr(llm_resp, "completion_text", "") if llm_resp else "",
+            has_send_operation=getattr(cron_event, "_has_send_oper", False),
+            direct_history_text=cron_event.get_extra(DIRECT_DELIVERY_TEXT_EXTRA, ""),
+            direct_delivery_kind=cron_event.get_extra(DIRECT_DELIVERY_KIND_EXTRA, ""),
         )
+        if delivery is None:
+            logger.debug(f"[Spark] Agent 无响应且未发送消息: {umo}")
+            return None
 
         # Store proactive replies as one ordinary-looking conversation round:
         # user placeholder + assistant response. This keeps future history reads
@@ -4104,7 +4623,7 @@ class Spark(Star):
                 await self._save_standard_proactive_history(
                     umo,
                     cid,
-                    response_text,
+                    delivery.history_text,
                     hook_history_len or 0,
                     datetime_reminder,
                 )
@@ -4113,11 +4632,11 @@ class Spark(Star):
         except Exception as e:
             logger.warning(f"[Spark] 保存对话历史失败: {e}")
 
-        return response_text
+        return delivery
 
     async def _run_legacy_llm(
         self, umo: str, prompt: str, provider=None, persona: str = ""
-    ) -> Optional[str]:
+    ) -> str | None:
         """Fallback: direct provider.text_chat() for older framework versions."""
         providers = self._get_gen_providers(umo)
         if provider:
@@ -4141,6 +4660,27 @@ class Spark(Star):
             f"{self._format_context_tail_for_log(contexts)}"
         )
 
+        req = None
+        if HAS_REQUEST_HOOKS:
+            session = MessageSession.from_str(umo)
+            cron_event = CronMessageEvent(
+                context=self.context,
+                session=session,
+                message=prompt,
+            )
+            req = ProviderRequest(
+                prompt=prompt,
+                contexts=contexts,
+                system_prompt=persona,
+            )
+            if await self._apply_proactive_request_hooks(
+                cron_event,
+                req,
+                umo=umo,
+                pipeline="legacy",
+            ):
+                return None
+
         last_err = None
         for provider_index, candidate in enumerate(providers):
             provider_id = self._provider_id(candidate) or "<unknown>"
@@ -4150,9 +4690,14 @@ class Spark(Star):
                 )
             try:
                 llm_resp = await candidate.text_chat(
-                    prompt=None,
-                    contexts=[{"role": "user", "content": prompt}] + contexts,
-                    system_prompt=persona,
+                    prompt=req.prompt if req else None,
+                    contexts=req.contexts
+                    if req
+                    else [{"role": "user", "content": prompt}] + contexts,
+                    system_prompt=req.system_prompt if req else persona,
+                    extra_user_content_parts=(
+                        req.extra_user_content_parts if req else None
+                    ),
                 )
                 text = (
                     llm_resp.completion_text
@@ -4243,7 +4788,8 @@ class Spark(Star):
                 return False
 
             if not getattr(self, "_last_cron_event_sent", False):
-                await self._send_text(umo, response_text)
+                if not await self._send_text(umo, response_text):
+                    return False
             logger.info(f"[Spark] 已发送 AI 提醒给 {umo}: {response_text[:50]}...")
 
             # Save history only for legacy path; agent pipeline saves history in _run_agent_pipeline.
@@ -4265,11 +4811,12 @@ class Spark(Star):
                 except Exception as e:
                     logger.warning(f"[Spark] 保存提醒历史失败: {e}")
 
-            # 更新状态
-            if umo not in self._states:
-                self._states[umo] = SessionState()
-            st = self._states[umo]
-            st.last_proactive_reply_ts = _now_tz(tz).timestamp()
+            self._record_proactive_delivery(
+                umo,
+                source="scheduled_reminder",
+                sent_at=_now_tz(tz).timestamp(),
+                response_text=response_text,
+            )
             await self._debounced_save_session_data()
 
             return True
@@ -4331,7 +4878,7 @@ class Spark(Star):
         except Exception as e:
             logger.error(f"[Spark] 添加消息对到历史失败: {e}", exc_info=True)
 
-    async def _get_last_messages(self, umo: str) -> Tuple[str, str]:
+    async def _get_last_messages(self, umo: str) -> tuple[str, str]:
         """从官方 conversation 历史中获取最近的 user 和 assistant 消息（供占位符使用）"""
         last_user = ""
         last_ai = ""
@@ -4500,7 +5047,7 @@ class Spark(Star):
             logger.warning(f"[Spark] 分段处理失败，使用原始文本: {e}")
             return [text]
 
-    async def _send_text(self, umo: str, text: str):
+    async def _send_text(self, umo: str, text: str) -> bool:
         """发送主动回复消息到指定会话"""
         try:
             # 检查 umo 是否缺少 session_id（例如：platform:MessageType:None）
@@ -4533,9 +5080,11 @@ class Spark(Star):
                 # 如果有多个分段，添加短暂延迟（模拟分段回复的间隔）
                 if len(segments) > 1:
                     await asyncio.sleep(1.5)
+            return True
 
         except Exception as e:
             logger.error(f"[Spark] ❌ 发送消息失败({umo}): {e}")
+            return False
 
     async def _send_reminder_message(self, umo: str, text: str):
         """发送提醒消息到指定会话"""
@@ -4545,6 +5094,11 @@ class Spark(Star):
     async def terminate(self):
         """插件销毁"""
         self._stopped = True  # 设置停止标志，让调度器循环退出
+        if (
+            getattr(self.context, "_spark_get_proactive_state", None)
+            == self._get_proactive_state
+        ):
+            delattr(self.context, "_spark_get_proactive_state")
 
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()

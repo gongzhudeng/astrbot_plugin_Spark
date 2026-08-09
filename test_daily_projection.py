@@ -64,7 +64,7 @@ def _timeline():
 
 
 def test_real_timeline_matches_wake():
-    wake = project_activity_candidates(_timeline(), ["醒来"], None, "start")
+    wake = project_activity_candidates(_timeline(), ["醒来"], "start")
     assert [(item.occurrence, item.boundary) for item in wake.candidates] == [
         (1, datetime(2026, 7, 16, 9, 17))
     ]
@@ -72,14 +72,14 @@ def test_real_timeline_matches_wake():
 
 def test_dsl_tag_外出_matches_all_outdoor_activities():
     """【外出】 tag reliably matches any activity with that tag, regardless of sentence structure."""
-    projection = project_activity_candidates(_timeline(), ["【外出】"], None, "start")
+    projection = project_activity_candidates(_timeline(), ["【外出】"], "start")
     assert len(projection.candidates) == 1
     assert "餐厅" in projection.candidates[0].activity
 
 
 def test_dsl_tag_用餐_matches_takeaway_and_dine_in():
     """【用餐】 matches both 外卖 and 堂食 activities."""
-    projection = project_activity_candidates(_timeline(), ["【用餐】"], None, "start")
+    projection = project_activity_candidates(_timeline(), ["【用餐】"], "start")
     activities = [c.activity for c in projection.candidates]
     assert any("麻辣烫" in a for a in activities), "should match takeaway"
     assert any("餐厅" in a for a in activities), "should match dine-in"
@@ -87,17 +87,15 @@ def test_dsl_tag_用餐_matches_takeaway_and_dine_in():
 
 
 def test_dsl_tag_主动分享_matches_sharing_activity():
-    projection = project_activity_candidates(
-        _timeline(), ["【主动分享】"], None, "start"
-    )
+    projection = project_activity_candidates(_timeline(), ["【主动分享】"], "start")
     assert len(projection.candidates) == 1
     assert "电影" in projection.candidates[0].activity
 
 
 def test_one_activity_projected_by_both_外出_and_用餐_slots():
     """The dine-out entry can be matched by both 外出 and 用餐 keywords independently."""
-    outdoor = project_activity_candidates(_timeline(), ["【外出】"], None, "start")
-    meal = project_activity_candidates(_timeline(), ["【用餐】"], None, "start")
+    outdoor = project_activity_candidates(_timeline(), ["【外出】"], "start")
+    meal = project_activity_candidates(_timeline(), ["【用餐】"], "start")
     dine_out = "小怡去餐厅吃晚饭【外出】【用餐】"
     outdoor_candidate = next(c for c in outdoor.candidates if c.activity == dine_out)
     meal_candidate = next(c for c in meal.candidates if c.activity == dine_out)
@@ -121,7 +119,7 @@ def test_identical_activity_text_keeps_distinct_timeline_identity():
         },
     ]
 
-    projection = project_activity_candidates(timeline, ["【用餐】"], None, "start")
+    projection = project_activity_candidates(timeline, ["【用餐】"], "start")
 
     assert [candidate.timeline_index for candidate in projection.candidates] == [0, 1]
 
@@ -141,8 +139,8 @@ def test_priority_selection_keeps_all_tied_highest_items():
 
 def test_wake_and_sleep_keywords_still_stable():
     """醒来 and 睡觉 match without relying on DSL tags."""
-    wake = project_activity_candidates(_timeline(), ["醒来"], None, "start")
-    sleep = project_activity_candidates(_timeline(), ["睡觉"], None, "start")
+    wake = project_activity_candidates(_timeline(), ["醒来"], "start")
+    sleep = project_activity_candidates(_timeline(), ["睡觉"], "start")
     assert wake.candidates[0].boundary == datetime(2026, 7, 16, 9, 17)
     assert sleep.candidates[0].boundary == datetime(2026, 7, 17, 1, 32)
 
@@ -160,19 +158,17 @@ def test_negative_sentence_no_false_positive():
             "error": "",
         }
     ]
-    outdoor = project_activity_candidates(
-        negative_timeline, ["【外出】"], None, "start"
-    )
-    meal = project_activity_candidates(negative_timeline, ["【用餐】"], None, "start")
+    outdoor = project_activity_candidates(negative_timeline, ["【外出】"], "start")
+    meal = project_activity_candidates(negative_timeline, ["【用餐】"], "start")
     assert outdoor.candidates == [], "no 【外出】 tag → should not match"
     assert meal.candidates == [], "no 【用餐】 tag → should not match"
 
 
-def test_occurrence_selection_uses_keyword_match_order():
-    meal_proj = project_activity_candidates(_timeline(), ["【用餐】"], {2}, "start")
-    assert len(meal_proj.candidates) == 1
-    assert meal_proj.candidates[0].occurrence == 2
-    assert "餐厅" in meal_proj.candidates[0].activity
+def test_all_keyword_matches_are_projected_for_interval_filtering():
+    meal_proj = project_activity_candidates(_timeline(), ["【用餐】"], "start")
+    assert [item.occurrence for item in meal_proj.candidates] == [1, 2]
+    assert "麻辣烫" in meal_proj.candidates[0].activity
+    assert "餐厅" in meal_proj.candidates[1].activity
 
 
 def test_invalid_boundary_is_reported_instead_of_scheduled():
@@ -184,7 +180,7 @@ def test_invalid_boundary_is_reported_instead_of_scheduled():
         "error": "ordinary activity is missing end_time",
     }
 
-    projection = project_activity_candidates(timeline, ["【用餐】"], None, "start")
+    projection = project_activity_candidates(timeline, ["【用餐】"], "start")
 
     assert [item.occurrence for item in projection.candidates] == [2]
     assert len(projection.issues) == 1
@@ -193,8 +189,6 @@ def test_invalid_boundary_is_reported_instead_of_scheduled():
 
 
 def test_missing_keyword_match_is_explicit():
-    projection = project_activity_candidates(
-        _timeline(), ["【不存在标签】"], None, "start"
-    )
+    projection = project_activity_candidates(_timeline(), ["【不存在标签】"], "start")
     assert projection.candidates == []
     assert projection.issues[0].status == "not_matched"

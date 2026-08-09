@@ -185,7 +185,7 @@ AstrBot/data/plugins/astrbot_plugin_Spark/
 | `time` | 固定时间，格式 `HH:MM` |
 | `activity_keywords` | 标签列表；活动名称包含任一关键词即匹配 |
 | `activity_boundary` | 使用 `活动开始` 或 `活动结束` 时间 |
-| `activity_occurrences` | 留空表示全部；`123` 与 `1,2,3` 都表示第 1/2/3 次，越界序号忽略 |
+| `activity_trigger_interval_minutes` | 活动模式下同一条问候距上次成功送达的最小间隔（分钟）；0 表示关闭 |
 | `prompt` | 问候语（支持占位符） |
 | `cooldown_minutes` | 聊天冷却；未满足时直接跳过，不调用判断或生成模型 |
 | `ignore_dnd` | 是否忽略免打扰和忙碌状态；无论取值如何都必须满足聊天冷却 |

@@ -219,9 +219,9 @@
       },
       "proactive_judge_prompt": {
         "description": "判断参考信息",
-        "hint": "作为判断的参考上下文，支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt} {time_period_prompt}。注意：判断步骤不走插件钩子，节律提示需手动通过 {time_period_prompt} 引入（需安装节律插件）",
+        "hint": "作为判断的参考上下文，支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt} {time_period_prompt} {emotion_state}。{emotion_state} 由内心世界插件只读提供；插件未安装或不可用时为空。节律提示需通过 {time_period_prompt} 引入（需安装节律插件）",
         "type": "text",
-        "default": "日程：{today_schedule}\\n当前活动：{current_activity}\\n用户节律：{time_period_prompt}\\n距上次聊天：{time_since_last_chat}"
+        "default": "日程：{today_schedule}\\n当前活动：{current_activity}\\n用户节律：{time_period_prompt}\\n内心世界：\\n{emotion_state}\\n距上次聊天：{time_since_last_chat}"
       },
       "proactive_judge_rules": {
         "description": "判断规则（放在最后，优先级最高）",
@@ -315,6 +315,12 @@
                 "type": "bool",
                 "default": false
               },
+              "task_id": {
+                "description": "稳定任务 ID（可选）",
+                "hint": "留空时沿用列表位置兼容旧状态；填写后即使调整时段顺序，也能保持每日任务去重身份。建议仅使用字母、数字、点、横线或下划线。",
+                "type": "string",
+                "default": ""
+              },
               "trigger_source": {
                 "description": "触发时间来源",
                 "hint": "固定时间与日程活动二选一；活动未匹配时当天不触发",
@@ -342,11 +348,11 @@
                 "options": ["活动开始", "活动结束"],
                 "default": "活动开始"
               },
-              "activity_occurrences": {
-                "description": "触发第几次匹配",
-                "hint": "留空表示全部；支持 123 或 1,2,3",
-                "type": "string",
-                "default": ""
+              "activity_trigger_interval_minutes": {
+                "description": "同问候触发间隔（分钟）",
+                "hint": "活动模式使用；同一条问候只有距上次成功送达达到此间隔才允许再次触发。判断跳过、免打扰、忙碌、聊天冷却和技术失败都不会刷新间隔；0 表示关闭。",
+                "type": "int",
+                "default": 0
               },
               "prompt": {
                 "description": "问候提示词",
@@ -360,6 +366,12 @@
               "ignore_dnd": {
                 "description": "忽略免打扰",
                 "hint": "绕过免打扰和忙碌状态，并保留唤醒清队列流程；始终不会绕过聊天冷却",
+                "type": "bool",
+                "default": false
+              },
+              "ignore_judge": {
+                "description": "忽略智能判断",
+                "hint": "打开后直接生成每日问候；关闭后先结合判断参考信息、最近对话和内心世界决定是否发送。",
                 "type": "bool",
                 "default": false
               },
@@ -385,6 +397,30 @@
           }
         },
         "default": []
+      },
+      "technical_retry_max_attempts": {
+        "description": "技术失败最大尝试次数",
+        "hint": "仅模型、网络或平台发送失败会重试；免打扰、忙碌和聊天冷却属于正常跳过，不重试。",
+        "type": "int",
+        "default": 3
+      },
+      "technical_retry_interval_seconds": {
+        "description": "技术失败重试基础间隔（秒）",
+        "hint": "后续失败使用有限指数退避，且不会超过重试窗口。",
+        "type": "int",
+        "default": 60
+      },
+      "technical_retry_window_minutes": {
+        "description": "技术失败重试窗口（分钟）",
+        "hint": "窗口从原目标时间开始；超过后终止，不把早晨问候补到下午。",
+        "type": "int",
+        "default": 15
+      },
+      "initial_trigger_grace_seconds": {
+        "description": "首次调度宽限（秒）",
+        "hint": "用于吸收 30 秒调度周期抖动；未在宽限内开始的任务记为已错过，不补发。",
+        "type": "int",
+        "default": 90
       },
       "ignore_busy_flush_delay_seconds": {
         "description": "唤醒忙碌后延迟（秒）",

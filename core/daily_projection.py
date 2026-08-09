@@ -48,7 +48,6 @@ def select_highest_priority(
 def project_activity_candidates(
     timeline: list[dict],
     keywords: list[str],
-    selected_occurrences: set[int] | None,
     boundary: str,
 ) -> ActivityProjection:
     matches = [
@@ -70,9 +69,6 @@ def project_activity_candidates(
     candidates = []
     issues = []
     for occurrence, (timeline_index, item) in enumerate(matches, start=1):
-        if selected_occurrences is not None and occurrence not in selected_occurrences:
-            continue
-
         activity = str(item.get("activity", ""))
         if not item.get("valid", True):
             issues.append(
