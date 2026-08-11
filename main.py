@@ -3760,6 +3760,7 @@ class Spark(Star):
             self._normalize_history_text(self._proactive_placeholder()),
             "[用户本人未发送消息，本轮为 AI 主动对 Mando 发起对话]",
             "[用户本人未说话，本轮为 AI 主动发起对话]",
+            "【会话占位：用户未发送新消息；助手在图片任务完成后补充通知】",
         }
         return normalized in known_placeholders
 
@@ -4283,7 +4284,12 @@ class Spark(Star):
             )
             if not content:
                 continue
-            speaker = "Mando" if role == "user" else "AI"
+            if role == "user" and self._is_proactive_placeholder(
+                msg.get("content", "")
+            ):
+                speaker = "系统占位"
+            else:
+                speaker = "Mando" if role == "user" else "AI"
             lines.append(f"{speaker}: {content[:160]}")
         return " | ".join(lines) if lines else "无"
 

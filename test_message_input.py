@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import pytest
+
 from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.provider.entities import ProviderRequest
@@ -145,6 +147,87 @@ def test_prompt_diagnostics_exposes_only_markers_and_counts():
     assert "private memory" not in str(diagnostics)
 
 
+def test_image_completion_placeholder_is_proactive_round_not_user_message():
+    placeholder = "【会话占位：用户未发送新消息；助手在图片任务完成后补充通知】"
+    plugin = Spark.__new__(Spark)
+    plugin.cfg = {"proactive_settings": {}}
+
+    assert plugin._is_proactive_placeholder(placeholder)
+    assert not plugin._is_proactive_placeholder(
+        "用户未发送新消息；助手在图片任务完成后补充通知"
+    )
+
+    contexts = [
+        {"role": "user", "content": "上一条真实用户消息"},
+        {"role": "assistant", "content": "上一条真实回复"},
+        {"role": "user", "content": placeholder},
+        {"role": "assistant", "content": "照片拍好了，我已经发出来了。"},
+    ]
+    projected, rounds = plugin._select_recent_round_contexts(contexts, rounds=2)
+
+    assert len(rounds) == 2
+    assert rounds[-1]["proactive"] is True
+    assert rounds[-1]["assistant"] == ["照片拍好了，我已经发出来了。"]
+    assert projected[-2] == {"role": "user", "content": placeholder}
+    assert "系统占位" in plugin._format_context_tail_for_log(contexts)
+
+
+@pytest.mark.asyncio
+async def test_last_messages_skips_image_completion_placeholder():
+    placeholder = "【会话占位：用户未发送新消息；助手在图片任务完成后补充通知】"
+    plugin = Spark.__new__(Spark)
+    plugin.cfg = {"proactive_settings": {}}
+
+    class _ConversationManager:
+        async def get_curr_conversation_id(self, umo):
+            return "conversation"
+
+        async def get_conversation(self, umo, conversation_id):
+            return SimpleNamespace(
+                history=[
+                    {"role": "user", "content": "上一条真实用户消息"},
+                    {"role": "assistant", "content": "上一条真实回复"},
+                    {"role": "user", "content": placeholder},
+                    {
+                        "role": "assistant",
+                        "content": "照片拍好了，我已经发出来了。",
+                    },
+                ]
+            )
+
+    plugin.context = SimpleNamespace(conversation_manager=_ConversationManager())
+
+    last_user, last_ai = await plugin._get_last_messages("default:FriendMessage:1")
+
+    assert last_user == "上一条真实用户消息"
+    assert last_ai == "照片拍好了，我已经发出来了。"
+
+
 def test_handles_empty_or_non_text_message_chains():
     assert not is_slash_prefixed_message([])
     assert not is_slash_prefixed_message([NonTextComponent(), TextComponent("  ")])
+
+
+def test_image_completion_placeholder_is_a_proactive_history_round():
+    placeholder = "【会话占位：用户未发送新消息；助手在图片任务完成后补充通知】"
+    plugin = Spark.__new__(Spark)
+    plugin.cfg = {"proactive_settings": {}}
+
+    assert plugin._is_proactive_placeholder(placeholder)
+    assert not plugin._is_proactive_placeholder("用户未发送新消息")
+
+    contexts = [
+        {"role": "user", "content": "给我拍张照片"},
+        {"role": "assistant", "content": "我去拍。"},
+        {"role": "user", "content": placeholder},
+        {"role": "assistant", "content": "拍好了，已经发给你。"},
+    ]
+    _, rounds = plugin._select_recent_round_contexts(contexts, rounds=2)
+
+    assert len(rounds) == 2
+    assert rounds[-1]["proactive"] is True
+    assert rounds[-1]["assistant"] == ["拍好了，已经发给你。"]
+    assert (
+        plugin._format_context_tail_for_log(contexts, limit=2)
+        == f"系统占位: {placeholder} | AI: 拍好了，已经发给你。"
+    )
