@@ -123,10 +123,9 @@ except ImportError as exc:
 
 # Import the full Agent Pipeline separately so the legacy provider path can still use hooks.
 try:
-    from astrbot.core.astr_main_agent import (
-        build_main_agent,
-        build_main_agent_config,
-    )
+    from astrbot.core.astr_main_agent import build_main_agent
+
+    from .core.agent_config import build_main_agent_config
 
     HAS_AGENT_PIPELINE = HAS_REQUEST_HOOKS
     AGENT_PIPELINE_IMPORT_ERROR = "" if HAS_REQUEST_HOOKS else REQUEST_HOOK_IMPORT_ERROR

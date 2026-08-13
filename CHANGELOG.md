@@ -1,5 +1,12 @@
 # 灵犀 · 主动对话 更新日志
 
+## v2.5.4
+
+### 修复
+
+- 兼容 AstrBot 4.27.3 移除 `build_main_agent_config` 的核心接口变更，恢复主动对话与 AI 提醒的 Agent Pipeline、知识库、记忆 hook 和框架上下文裁剪能力
+- 新增主 Agent 配置适配层；旧版 AstrBot 仍优先复用框架原生构建函数，当前版本则按核心 `MainAgentBuildConfig` 完整映射配置
+
 ## v2.5.3
 
 ### 新增
