@@ -571,7 +571,7 @@ async def test_judge_automatically_appends_emotion_to_old_template():
     plugin._refresh_realtime_context = AsyncMock()
     plugin._get_last_messages = AsyncMock(return_value=("last user", "last ai"))
     plugin._get_conversation_contexts = AsyncMock(return_value=[])
-    plugin._get_judge_providers = lambda _umo: [provider]
+    plugin._get_judge_providers = lambda _umo, **_kwargs: [provider]
     plugin._resolve_persona = lambda *_keys: "judge persona"
     plugin._get_emotion_judge_context = AsyncMock(
         return_value="<emotion_state_snapshot>当前心境</emotion_state_snapshot>"

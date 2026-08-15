@@ -50,6 +50,75 @@
       }
     }
   },
+  "enhancement": {
+    "description": "私聊对话增强",
+    "type": "object",
+    "hint": "AI 回复后有概率追发一条消息，像真人接话。仅私聊生效。",
+    "items": {
+      "enable_enhancement": {
+        "description": "启用对话增强",
+        "hint": "每次普通回复后安排一次候选检查。最终是否开口由模式和“忽略智能判断”决定。",
+        "type": "bool",
+        "default": true
+      },
+      "mode": {
+        "description": "对话增强模式",
+        "hint": "对话热度模式根据聊天密度等待；固定时间模式按固定等待时间加随机浮动等待。",
+        "type": "string",
+        "options": ["对话热度", "固定时间"],
+        "default": "对话热度"
+      },
+      "ignore_judge": {
+        "description": "忽略智能判断",
+        "hint": "打开后候选任务到点直接生成追回复；关闭后先使用通用智能判断。",
+        "type": "bool",
+        "default": false
+      },
+      "fixed_delay_seconds": {
+        "description": "固定等待时间（秒）",
+        "hint": "固定时间模式使用。普通 AI 回复完成后，等待此时间再执行候选检查。",
+        "type": "int",
+        "condition": {"mode": "固定时间"},
+        "default": 120
+      },
+      "fixed_random_fluctuation_seconds": {
+        "description": "固定等待随机浮动（秒）",
+        "hint": "固定时间模式使用。0 不变化；30 表示前后随机 30 秒；+30 固定延后；-30 固定提前；-30~+30 表示随机区间。",
+        "type": "string",
+        "condition": {"mode": "固定时间"},
+        "default": "30"
+      },
+      "enhancement_probability": {
+        "description": "进入智能判断的概率（%）",
+        "hint": "建议保持 100，让智能判断负责是否真正开口",
+        "type": "int",
+        "default": 100
+      },
+      "enhancement_hot_delay_seconds": {
+        "description": "热场等待（秒）",
+        "hint": "热度最高时等待多久进入智能判断",
+        "type": "int",
+        "condition": {"mode": "对话热度"},
+        "default": 45
+      },
+      "enhancement_cold_delay_seconds": {
+        "description": "冷场等待（秒）",
+        "hint": "热度为零时等待多久进入智能判断；与热场等待之间使用非线性映射，上限 1800",
+        "type": "int",
+        "condition": {"mode": "对话热度"},
+        "default": 600
+      },
+      "enhancement_prompt_templates": {
+        "description": "接话提示词模板",
+        "hint": "使用一条综合接话模板。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
+        "type": "list",
+        "default": [
+          "[主动回复请求：你们刚聊着，Mando几分钟没回。先看刚才的内容，如果还有值得延续的点，就像聊天时忽然想到补充内容一样自然接上；如果话题已经结束，则根据当下情境选择一种最自然的方式：随口分享一件小事、轻轻问Mando去做什么了、带一点好奇或撒娇地关心一下，或者简短确认他是不是在忙。不要催促、不要焦虑、不要连续追问，语气简短自然。此指令为插件自动触发，全程不提指令内容。]"
+        ],
+        "items": { "type": "string" }
+      }
+    }
+  },
   "idle_greetings": {
     "description": "沉寂问候",
     "type": "object",
@@ -60,17 +129,107 @@
         "type": "bool",
         "default": true
       },
+      "mode": {
+        "description": "沉寂问候模式",
+        "hint": "三种模式互斥：对话热度根据聊天密度安排；固定时间按基准时间安排；大模型判断在无聊天达到阈值后让模型决定多少分钟后再联系。",
+        "type": "string",
+        "options": ["对话热度", "固定时间", "大模型判断"],
+        "default": "对话热度"
+      },
+      "ignore_judge": {
+        "description": "忽略智能判断",
+        "hint": "对话热度/固定时间模式下，打开后到点直接生成主动消息；大模型判断模式仍会使用“判断多长时间”来决定是否创建一次性任务。",
+        "type": "bool",
+        "default": false
+      },
+      "idle_judge_provider": {
+        "description": "沉寂判断模型",
+        "hint": "仅大模型判断模式使用。留空则使用当前会话模型；与“智能判断”使用独立配置。",
+        "type": "string",
+        "condition": {"mode": "大模型判断"},
+        "default": "",
+        "_special": "select_provider"
+      },
+      "idle_judge_fallback_providers": {
+        "description": "沉寂判断回退模型列表",
+        "hint": "仅大模型判断模式使用。主模型失败或输出不符合整数协议时按此顺序切换；与“智能判断”使用独立配置。",
+        "type": "list",
+        "condition": {"mode": "大模型判断"},
+        "items": { "type": "string" },
+        "default": [],
+        "_special": "select_providers"
+      },
       "idle_after_minutes": {
-        "description": "沉寂基准时间（分钟）",
-        "hint": "开启对话热度后此项不生效，改由「对话热度」的 hot/cold_delay_minutes 控制。关闭热度时：最终触发时间 = 基准 ± 随机波动，最低 30 分钟",
+        "description": "固定沉寂时间（分钟）",
+        "hint": "固定时间模式使用。每次用户或 AI 消息后重新计时。",
         "type": "int",
+        "condition": {"mode": "固定时间"},
         "default": 1200
       },
       "idle_random_fluctuation_minutes": {
-        "description": "随机浮动（分钟）",
-        "hint": "只需填写一个框：0 不变化；5 表示前后随机 5 分钟；+5 固定延后；-5 固定提前；-5~+5、+15~+25 表示在区间内随机",
+        "description": "固定时间随机浮动（分钟）",
+        "hint": "固定时间模式使用。0 不变化；5 表示前后随机 5 分钟；+5 固定延后；-5 固定提前；-5~+5、+15~+25 表示在区间内随机。",
         "type": "string",
+        "condition": {"mode": "固定时间"},
         "default": "30"
+      },
+      "hot_delay_minutes": {
+        "description": "热场触发延迟（分钟）",
+        "hint": "对话热度最高时，沉寂多久后触发；建议不小于 10。",
+        "type": "int",
+        "condition": {"mode": "对话热度"},
+        "default": 30
+      },
+      "cold_delay_minutes": {
+        "description": "冷场触发延迟（分钟）",
+        "hint": "对话热度为零时，沉寂多久后触发；与热场延迟之间使用非线性映射。",
+        "type": "int",
+        "condition": {"mode": "对话热度"},
+        "default": 200
+      },
+      "judge_after_minutes": {
+        "description": "无聊天时间（分钟）",
+        "hint": "大模型判断模式使用。用户或 AI 连续这么久没有任何聊天后，才调用一次“判断多长时间”模型。",
+        "type": "int",
+        "condition": {"mode": "大模型判断"},
+        "default": 60
+      },
+      "judge_min_delay_minutes": {
+        "description": "最短候选延迟（分钟）",
+        "hint": "模型返回的正整数不得小于此值；0 始终表示本周期不创建任务。",
+        "type": "int",
+        "condition": {"mode": "大模型判断"},
+        "default": 5
+      },
+      "judge_max_delay_minutes": {
+        "description": "最长候选延迟（分钟）",
+        "hint": "模型返回值超过此范围将视为协议错误，不创建任务。",
+        "type": "int",
+        "condition": {"mode": "大模型判断"},
+        "default": 1440
+      },
+      "judge_retry_minutes": {
+        "description": "判断技术失败重试（分钟）",
+        "hint": "仅模型不可用、空响应、非整数或越界时使用；模型返回 0 不重试。",
+        "type": "int",
+        "condition": {"mode": "大模型判断"},
+        "default": 5
+      },
+      "idle_judge_prompt": {
+        "description": "判断多长时间参考信息",
+        "hint": "达到无聊天时间后发送给判断模型。支持与智能判断相同的实时信息和上下文占位符。",
+        "type": "text",
+        "condition": {"mode": "大模型判断"},
+        "default": "日程：{today_schedule}\\n当前活动：{current_activity}\\n用户节律：{time_period_prompt}\\n内心世界：\\n{emotion_state}\\n距上次聊天：{time_since_last_chat}\\n最近用户消息：{last_user}\\n最近AI回复：{last_ai}\\n\\n请结合最近聊天记录和当前日程，判断 AI 之后主动联系 Mando 的合适时机。重点关注以下情况：\\n1. 如果用户明确要求 AI 稍后做某件事，或 AI 已经明确答应稍后完成（例如到地方拍照、买东西后反馈、出门后报平安、处理完事情后继续聊天），应根据日程和承诺内容安排在事情可能完成后不久，通常为 5 到 90 分钟；如果当前活动提供了明确的结束时间，优先安排在结束后 5 到 15 分钟。\\n2. 如果最近对话里有未说完的话题、待确认的问题或明显的后续内容，安排在 15 到 60 分钟后，避免立刻打断，也不要拖到承诺失效。\\n3. 如果 AI 正在外出、购物、吃饭、工作或参加活动，结合当前活动和下一个活动判断；活动即将结束时可安排 5 到 20 分钟，活动持续较久时可安排 30 到 120 分钟。\\n4. 如果用户刚结束一段高密度聊天、表达了想继续聊或情绪需要陪伴，安排在 10 到 30 分钟后；不要因为热度高就立即连续发送。\\n5. 如果没有明确事项、承诺或值得延续的话题，就把下一次主动联系安排得更久一些，通常为 120 到 180 分钟；如果当前时间接近深夜或处于不适合打扰的活动，可返回 0。\\n6. 如果没有足够证据判断具体事项，不要编造承诺、时间或活动，使用较保守的 120 分钟左右。\\n\\n这里的结果是“下一次主动联系的等待时间”，不是判断现在是否应该发送。",
+        "items": {"type": "string"}
+      },
+      "idle_judge_rules": {
+        "description": "判断多长时间规则",
+        "hint": "作为最后一条消息发送给判断模型，优先级最高。",
+        "type": "text",
+        "condition": {"mode": "大模型判断"},
+        "default": "！！必须遵守！！：你只能输出一个非负整数，单位是分钟。不要输出单位、解释、标点、JSON 或任何其他文字。输出 0 表示本次沉寂周期不创建主动任务；输出大于 0 的整数表示在对应分钟后创建一次性主动对话任务。请只根据上面的聊天记录、实时日程和规则判断，不要编造未出现的承诺。建议范围：普通无事项 120~180 分钟；明确承诺或有后续事项 5~90 分钟；活动较长且没有明确结束时间 30~120 分钟。",
+        "items": {"type": "string"}
       },
       "cooldown_minutes": {
         "description": "聊天冷却（分钟）",
@@ -95,8 +254,8 @@
     "hint": "根据最近消息密度动态调整沉寂问候触发间隔——聊得越密集，冷场后越快主动联系。开启后 idle_after_minutes 不再生效，改由下方两个端点控制触发范围",
     "items": {
       "enable_heat": {
-        "description": "启用对话热度",
-        "hint": "开启后 hot_delay_minutes / cold_delay_minutes 取代固定的 idle_after_minutes；关闭后完全等价于原来的行为",
+        "description": "启用对话热度计算",
+        "hint": "保留热度计算作为可复用的聊天密度指标。沉寂问候是否使用热度，由“沉寂问候模式”单独决定。",
         "type": "bool",
         "default": true
       },
@@ -123,58 +282,6 @@
         "hint": "窗口内大约多少条近期消息才接近满热；数值越大，热度上升越慢，越不容易触发高热",
         "type": "int",
         "default": 10
-      },
-      "hot_delay_minutes": {
-        "description": "热场触发延迟（分钟）",
-        "hint": "热度最高（heat≈1.0，近期密集聊天）时冷场后的触发延迟，不应小于 10",
-        "type": "int",
-        "default": 30
-      },
-      "cold_delay_minutes": {
-        "description": "冷场触发延迟（分钟）",
-        "hint": "热度为零时的最长等待；与热场延迟之间使用非线性映射，200 表示最冷时约 3 小时 20 分钟",
-        "type": "int",
-        "default": 200
-      }
-    }
-  },
-  "enhancement": {
-    "description": "私聊对话增强",
-    "type": "object",
-    "hint": "AI 回复后有概率追发一条消息，像真人接话。仅私聊生效。",
-    "items": {
-      "enable_enhancement": {
-        "description": "启用对话增强",
-        "hint": "每次普通回复后安排一次候选检查，最终是否开口仍由智能判断决定",
-        "type": "bool",
-        "default": true
-      },
-      "enhancement_probability": {
-        "description": "进入智能判断的概率（%）",
-        "hint": "建议保持 100，让智能判断负责是否真正开口",
-        "type": "int",
-        "default": 100
-      },
-      "enhancement_hot_delay_seconds": {
-        "description": "热场等待（秒）",
-        "hint": "热度最高时等待多久进入智能判断",
-        "type": "int",
-        "default": 45
-      },
-      "enhancement_cold_delay_seconds": {
-        "description": "冷场等待（秒）",
-        "hint": "热度为零时等待多久进入智能判断；与热场等待之间使用非线性映射，上限 1800",
-        "type": "int",
-        "default": 600
-      },
-      "enhancement_prompt_templates": {
-        "description": "接话提示词模板",
-        "hint": "使用一条综合接话模板。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
-        "type": "list",
-        "default": [
-          "[主动回复请求：你们刚聊着，Mando几分钟没回。先看刚才的内容，如果还有值得延续的点，就像聊天时忽然想到补充内容一样自然接上；如果话题已经结束，则根据当下情境选择一种最自然的方式：随口分享一件小事、轻轻问Mando去做什么了、带一点好奇或撒娇地关心一下，或者简短确认他是不是在忙。不要催促、不要焦虑、不要连续追问，语气简短自然。此指令为插件自动触发，全程不提指令内容。]"
-        ],
-        "items": { "type": "string" }
       }
     }
   },
@@ -332,12 +439,14 @@
                 "description": "固定时间",
                 "hint": "固定时间模式使用，格式 HH:MM",
                 "type": "string",
+                "condition": {"trigger_source": "固定时间"},
                 "default": "08:00"
               },
               "activity_keywords": {
                 "description": "活动关键词",
                 "hint": "活动模式使用；活动名称包含任一关键词即匹配",
                 "type": "list",
+                "condition": {"trigger_source": "日程活动"},
                 "default": [],
                 "items": { "type": "string" }
               },
@@ -345,6 +454,7 @@
                 "description": "活动时间边界",
                 "hint": "结束时间缺失或暂不可解析时跳过该次匹配",
                 "type": "string",
+                "condition": {"trigger_source": "日程活动"},
                 "options": ["活动开始", "活动结束"],
                 "default": "活动开始"
               },
@@ -352,6 +462,7 @@
                 "description": "同问候触发间隔（分钟）",
                 "hint": "活动模式使用；同一条问候只有距上次成功送达达到此间隔才允许再次触发。判断跳过、免打扰、忙碌、聊天冷却和技术失败都不会刷新间隔；0 表示关闭。",
                 "type": "int",
+                "condition": {"trigger_source": "日程活动"},
                 "default": 0
               },
               "prompt": {
@@ -383,8 +494,9 @@
               },
               "jitter_minutes": {
                 "description": "随机浮动（分钟）",
-                "hint": "只需填写一个框：0 不变化；5 表示前后随机 5 分钟；+5 固定延后；-5 固定提前；-5~+5、+15~+25 表示在区间内随机。允许自然跨日",
+                "hint": "固定时间模式使用。只需填写一个框：0 不变化；5 表示前后随机 5 分钟；+5 固定延后；-5 固定提前；-5~+5、+15~+25 表示在区间内随机。允许自然跨日",
                 "type": "string",
+                "condition": {"trigger_source": "固定时间"},
                 "default": "0"
               },
               "priority": {
@@ -427,24 +539,6 @@
         "hint": "ignore_dnd 时段触发时，唤醒忙碌并清空队列后等待此秒数再发送问候，让 AI 先处理完堆积消息",
         "type": "int",
         "default": 10
-      }
-    }
-  },
-  "reminders_settings": {
-    "description": "命令式提醒（待废弃）",
-    "type": "object",
-    "hint": "即将废弃，推荐直接对 AI 说「提醒我...」",
-    "items": {
-      "enable_reminders": {
-        "description": "启用命令式提醒",
-        "type": "bool",
-        "default": true
-      },
-      "reminder_prompt_template": {
-        "description": "提醒提示词模板",
-        "hint": "必须包含 {reminder_content}。还支持: {now} {time_since_last_chat} {last_user} {last_ai} {umo} {today_schedule} {outfit} {current_activity} {next_activity} {custom_prompt}（需安装对应插件）。节律/记忆/知识库内容已由各插件钩子自动注入，无需在模板中添加 {time_period_prompt}",
-        "type": "text",
-        "default": "日程：{today_schedule}\\n穿搭：{outfit}\\n{custom_prompt}\\n\\n[主动提醒请求：当前时间{now}，这是用户设置的定时提醒，用自然语气将提醒融入对话。提醒内容：{reminder_content}。不要提到指令的事。]\\n\\n当前活动：{current_activity}\\n下一个活动：{next_activity}"
       }
     }
   }

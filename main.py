@@ -65,12 +65,13 @@ from .core.provider_fallback import (
 from .core.time_policy import (
     apply_datetime_policy,
     apply_delay_policy,
+    apply_seconds_policy,
     cooldown_deadline,
     migrate_compact_policy_values,
     parse_policy,
 )
 
-SESSION_DATA_SCHEMA_VERSION = 3
+SESSION_DATA_SCHEMA_VERSION = 4
 
 # 尝试导入 StarTools（如果可用）
 try:
@@ -279,7 +280,6 @@ class UserProfile:
     subscribed: bool = False
     idle_after_minutes: int | None = None
     daily_reminders_enabled: bool = True
-    daily_reminder_count: int = 3
     quiet_hours: str | None = None  # 用户专属免打扰时间 "HH:MM-HH:MM"
     manual_unsubscribe: bool = False  # 标记是否是手动退订（强开关）
     auto_unsubscribed: bool = False  # 标记是否是自动退订（用于自动重新激活判断）
@@ -289,7 +289,6 @@ class UserProfile:
             "subscribed": self.subscribed,
             "idle_after_minutes": self.idle_after_minutes,
             "daily_reminders_enabled": self.daily_reminders_enabled,
-            "daily_reminder_count": self.daily_reminder_count,
             "quiet_hours": self.quiet_hours,
             "manual_unsubscribe": self.manual_unsubscribe,
             "auto_unsubscribed": self.auto_unsubscribed,
@@ -301,7 +300,6 @@ class UserProfile:
             subscribed=data.get("subscribed", False),
             idle_after_minutes=data.get("idle_after_minutes"),
             daily_reminders_enabled=data.get("daily_reminders_enabled", True),
-            daily_reminder_count=data.get("daily_reminder_count", 3),
             quiet_hours=data.get("quiet_hours"),
             manual_unsubscribe=data.get("manual_unsubscribe", False),
             auto_unsubscribed=data.get("auto_unsubscribed", False),
@@ -325,6 +323,12 @@ class SessionState:
     consecutive_no_reply_count: int = 0
     next_idle_ts: float = 0.0
     idle_retry_after_ts: float = 0.0
+    idle_judge_cycle: int = 0
+    idle_judge_checked_cycle: int = -1
+    idle_judge_inflight_cycle: int = -1
+    idle_judge_task_ts: float = 0.0
+    idle_judge_anchor_ts: float = 0.0
+    idle_schedule_mode: str = ""
     last_proactive_reply_ts: float = 0.0  # 最近一次主动回复时间戳
     last_ai_reply_ts: float = 0.0  # 最近一次 AI 普通回复时间戳（用于对话增强取消判断）
     msg_timestamps: list = (
@@ -362,6 +366,13 @@ class SessionState:
             self.proactive_recent_messages = []
         self.proactive_evidence_schema_version = EVIDENCE_SCHEMA_VERSION
         self.proactive_evidence = normalize_evidence_records(self.proactive_evidence)
+        if (
+            self.idle_judge_inflight_cycle == self.idle_judge_cycle
+            and self.idle_judge_task_ts <= 0
+        ):
+            self.idle_judge_checked_cycle = -1
+            self.idle_judge_inflight_cycle = -1
+            self.next_idle_ts = 0.0
 
     def to_dict(self):
         return {
@@ -380,6 +391,12 @@ class SessionState:
             "consecutive_no_reply_count": self.consecutive_no_reply_count,
             "next_idle_ts": self.next_idle_ts,
             "idle_retry_after_ts": self.idle_retry_after_ts,
+            "idle_judge_cycle": self.idle_judge_cycle,
+            "idle_judge_checked_cycle": self.idle_judge_checked_cycle,
+            "idle_judge_inflight_cycle": self.idle_judge_inflight_cycle,
+            "idle_judge_task_ts": self.idle_judge_task_ts,
+            "idle_judge_anchor_ts": self.idle_judge_anchor_ts,
+            "idle_schedule_mode": self.idle_schedule_mode,
             "last_proactive_reply_ts": self.last_proactive_reply_ts,
             "last_ai_reply_ts": self.last_ai_reply_ts,
             "msg_timestamps": self.msg_timestamps if self.msg_timestamps else [],
@@ -414,6 +431,12 @@ class SessionState:
             consecutive_no_reply_count=data.get("consecutive_no_reply_count", 0),
             next_idle_ts=data.get("next_idle_ts", 0.0),
             idle_retry_after_ts=data.get("idle_retry_after_ts", 0.0),
+            idle_judge_cycle=data.get("idle_judge_cycle", 0),
+            idle_judge_checked_cycle=data.get("idle_judge_checked_cycle", -1),
+            idle_judge_inflight_cycle=data.get("idle_judge_inflight_cycle", -1),
+            idle_judge_task_ts=data.get("idle_judge_task_ts", 0.0),
+            idle_judge_anchor_ts=data.get("idle_judge_anchor_ts", 0.0),
+            idle_schedule_mode=data.get("idle_schedule_mode", ""),
             last_proactive_reply_ts=data.get("last_proactive_reply_ts", 0.0),
             last_ai_reply_ts=data.get("last_ai_reply_ts", 0.0),
             msg_timestamps=msg_ts,
@@ -526,43 +549,13 @@ class DailyGreetingProjection:
     issues: list[DailyGreetingIssue]
 
 
-@dataclass
-class Reminder:
-    """用户设置的提醒事项"""
-
-    id: str
-    umo: str
-    content: str
-    at: str  # "YYYY-MM-DD HH:MM" 或 "HH:MM|daily"
-    created_at: float
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "umo": self.umo,
-            "content": self.content,
-            "at": self.at,
-            "created_at": self.created_at,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(
-            id=data.get("id"),
-            umo=data.get("umo"),
-            content=data.get("content"),
-            at=data.get("at"),
-            created_at=data.get("created_at"),
-        )
-
-
 # 灵犀 · 主动对话插件
 # 灵感参考：astrbot_plugin_Conversa v3.0.0 (Luna-channel)
 @register(
     "astrbot_plugin_Spark",
     "灵犀 · 主动对话",
     "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候",
-    "2.5.2",
+    "2.6.0",
     "https://github.com/gongzhudeng/astrbot_plugin_Spark",
 )
 class Spark(Star):
@@ -576,7 +569,6 @@ class Spark(Star):
         # 运行时数据
         self._states: dict[str, SessionState] = {}
         self._user_profiles: dict[str, UserProfile] = {}
-        self._reminders: dict[str, Reminder] = {}
         self._timeline_warning_at: float = 0.0
 
         # 文件保存去抖相关
@@ -755,8 +747,114 @@ class Spark(Star):
                 if "heat_messages_for_full_score" not in heat:
                     heat["heat_messages_for_full_score"] = 10
                     changed = True
+                idle = self.cfg.get("idle_greetings") or {}
+                if not isinstance(idle, dict):
+                    idle = {}
+                if "mode" not in idle:
+                    idle["mode"] = (
+                        "对话热度"
+                        if bool(heat.get("enable_heat", True))
+                        else "固定时间"
+                    )
+                    changed = True
+                for key in ("hot_delay_minutes", "cold_delay_minutes"):
+                    if key not in idle and key in heat:
+                        idle[key] = heat[key]
+                        changed = True
+                if "idle_after_minutes" not in idle and "idle_after_minutes" in heat:
+                    idle["idle_after_minutes"] = heat["idle_after_minutes"]
+                    changed = True
+                for key, default in (
+                    ("judge_after_minutes", 60),
+                    ("judge_min_delay_minutes", 5),
+                    ("judge_max_delay_minutes", 1440),
+                ):
+                    if key not in idle:
+                        idle[key] = default
+                        changed = True
+                self.cfg["idle_greetings"] = idle
                 self.cfg["heat_settings"] = heat
 
+            idle = self.cfg.get("idle_greetings") or {}
+            if isinstance(idle, dict):
+                legacy_idle_fluctuation = idle.get(
+                    "random_fluctuation_minutes",
+                    idle.get("jitter_minutes"),
+                )
+                if (
+                    "idle_random_fluctuation_minutes" not in idle
+                    and legacy_idle_fluctuation not in (None, "")
+                ):
+                    idle["idle_random_fluctuation_minutes"] = legacy_idle_fluctuation
+                    changed = True
+                for old_key, new_key in (
+                    ("hot_delay_minutes", "hot_delay_minutes"),
+                    ("cold_delay_minutes", "cold_delay_minutes"),
+                ):
+                    if new_key not in idle and old_key in heat:
+                        idle[new_key] = heat[old_key]
+                        changed = True
+                self.cfg["idle_greetings"] = idle
+
+            idle = self.cfg.get("idle_greetings") or {}
+            if isinstance(idle, dict):
+                provider_migration_marker = "_idle_judge_provider_migrated"
+                migration_complete = bool(idle.get(provider_migration_marker, False))
+                legacy_provider = proactive.get("proactive_judge_provider", "")
+                legacy_fallbacks = proactive.get(
+                    "proactive_judge_fallback_providers", []
+                )
+                has_legacy_provider = bool(str(legacy_provider or "").strip())
+                has_legacy_fallbacks = isinstance(legacy_fallbacks, list) and bool(
+                    legacy_fallbacks
+                )
+                if not migration_complete:
+                    # Schema defaults may materialize the new fields as empty values
+                    # before this hook runs. Only a non-empty legacy chain is copied.
+                    if (
+                        not str(idle.get("idle_judge_provider") or "").strip()
+                        and has_legacy_provider
+                    ):
+                        idle["idle_judge_provider"] = legacy_provider
+                        changed = True
+                    if (
+                        not idle.get("idle_judge_fallback_providers")
+                        and has_legacy_fallbacks
+                    ):
+                        idle["idle_judge_fallback_providers"] = list(legacy_fallbacks)
+                        changed = True
+
+                    # This marker is written even when no legacy chain exists. That
+                    # distinguishes a new user's intentional empty configuration from
+                    # an old configuration that still needs one-time migration.
+                    idle[provider_migration_marker] = True
+                    changed = True
+                    logger.info("[Spark] completed idle judge provider migration")
+                self.cfg["idle_greetings"] = idle
+
+            enhancement = self.cfg.get("enhancement") or {}
+            if isinstance(enhancement, dict):
+                if "mode" not in enhancement:
+                    enhancement["mode"] = "对话热度"
+                    changed = True
+                if "fixed_delay_seconds" not in enhancement:
+                    old_fixed = enhancement.get("enhancement_min_delay")
+                    if old_fixed not in (None, ""):
+                        enhancement["fixed_delay_seconds"] = old_fixed
+                        changed = True
+                if "fixed_random_fluctuation_seconds" not in enhancement:
+                    old_jitter = enhancement.get(
+                        "random_fluctuation_seconds",
+                        enhancement.get("jitter_seconds"),
+                    )
+                    enhancement["fixed_random_fluctuation_seconds"] = (
+                        old_jitter if old_jitter not in (None, "") else "0"
+                    )
+                    changed = True
+                if "ignore_judge" not in enhancement:
+                    enhancement["ignore_judge"] = False
+                    changed = True
+                self.cfg["enhancement"] = enhancement
             if advanced.get("fixed_provider") and not proactive.get("fixed_provider"):
                 proactive["fixed_provider"] = advanced["fixed_provider"]
                 changed = True
@@ -796,97 +894,6 @@ class Spark(Star):
                 self.cfg.save_config()
         except Exception as e:
             logger.debug(f"[Spark] config migration: {e}")
-
-    async def _migrate_reminders_to_cron(self) -> str:
-        """将旧版提醒迁移到 AstrBot 原生 cron 系统（幂等，重复执行安全）"""
-        if not self._reminders:
-            return "没有需要迁移的提醒。"
-        cron_mgr = getattr(self.context, "cron_manager", None)
-        if not cron_mgr:
-            return "❌ cron_manager 不可用，无法迁移。"
-
-        # 预取已有 jobs 用于幂等检查
-        existing_jobs = await cron_mgr.list_jobs()
-        existing_map = {j.name: j for j in existing_jobs}
-
-        migrated = 0
-        failed = 0
-        for rid, reminder in list(self._reminders.items()):
-            try:
-                at = reminder.at
-                umo = reminder.umo
-                content = reminder.content
-
-                job_name = f"spark_migrate_{rid}"
-                template = (
-                    self._get_cfg("reminders_settings", "reminder_prompt_template")
-                    or "提醒内容：{reminder_content}"
-                )
-                note = template.replace("{reminder_content}", content)
-
-                # 构建正确的 cron 表达式或一次性参数
-                is_daily = "|daily" in at
-                cron_expr = None
-                run_at = None
-                if is_daily:
-                    hhmm = at.split("|", 1)[0]
-                    t = _parse_hhmm(hhmm)
-                    if not t:
-                        failed += 1
-                        continue
-                    cron_expr = f"{t[1]} {t[0]} * * *"
-                else:
-                    try:
-                        run_at = datetime.strptime(at, "%Y-%m-%d %H:%M")
-                    except ValueError:
-                        failed += 1
-                        continue
-
-                # 幂等检查：同名 job 已存在则删除重建（覆盖）
-                existing = existing_map.get(job_name)
-                if existing:
-                    await cron_mgr.delete_job(existing.job_id)
-
-                if is_daily:
-                    await cron_mgr.add_active_job(
-                        name=job_name,
-                        cron_expression=cron_expr,
-                        payload={
-                            "session": umo,
-                            "note": note,
-                            "origin": "spark_migrate",
-                        },
-                        description=f"[Spark迁移] {content[:60]}",
-                        run_once=False,
-                    )
-                else:
-                    await cron_mgr.add_active_job(
-                        name=job_name,
-                        cron_expression=None,
-                        payload={
-                            "session": umo,
-                            "note": note,
-                            "origin": "spark_migrate",
-                        },
-                        description=f"[Spark迁移] {content[:60]}",
-                        run_once=True,
-                        run_at=run_at,
-                    )
-                migrated += 1
-
-            except Exception as e:
-                logger.error(f"[Spark] 迁移提醒 {rid} 失败: {e}")
-                failed += 1
-
-        parts = []
-        if migrated > 0:
-            parts.append(f"✅ 已迁移 {migrated} 个提醒到 AstrBot 原生定时任务")
-            parts.append("旧数据已保留，可继续通过 /conversa remind 管理")
-        if failed > 0:
-            parts.append(f"❌ {failed} 个迁移失败")
-        if not parts:
-            parts.append("没有需要迁移的提醒。")
-        return "\n".join(parts)
 
     async def initialize(self):
         """插件激活时的初始化方法（框架生命周期）"""
@@ -976,6 +983,11 @@ class Spark(Star):
         )
         state.last_ts = sent_at
         state.last_proactive_reply_ts = sent_at
+        profile = self._user_profiles.get(umo)
+        if profile:
+            # A successful proactive message starts a fresh idle cycle. This also
+            # invalidates a different pending candidate for the same session.
+            self._reset_idle_schedule(state, sent_at, profile)
         return record
 
     def _get_int_cfg(self, group_key: str, sub_key: str, default: int) -> int:
@@ -1021,49 +1033,71 @@ class Spark(Star):
             short_weight=short_weight,
         )
 
+    def _idle_mode(self) -> str:
+        mode = str(self._get_cfg("idle_greetings", "mode", "") or "").strip()
+        if mode in {"对话热度", "固定时间", "大模型判断"}:
+            return mode
+        return (
+            "对话热度"
+            if bool(self._get_cfg("heat_settings", "enable_heat", True))
+            else "固定时间"
+        )
+
+    def _idle_judge_after_minutes(self) -> int:
+        return max(1, self._get_int_cfg("idle_greetings", "judge_after_minutes", 60))
+
+    def _latest_chat_ts(self, st: SessionState) -> float:
+        return max(
+            float(st.last_user_reply_ts or 0),
+            float(st.last_ai_reply_ts or 0),
+            float(st.last_proactive_reply_ts or 0),
+        )
+
     def _calc_idle_delay(
         self, st: SessionState, now_ts: float, profile: UserProfile
     ) -> float:
-        """Return the base idle-greeting delay in minutes, applying heat scaling when enabled.
-
-        When heat is disabled, falls back to the user/global idle_after_minutes setting.
-        Fluctuation is applied by the caller.
-        """
-        heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
-        if heat_enabled:
-            hot_m = float(self._get_cfg("heat_settings", "hot_delay_minutes", 30) or 30)
-            cold_m = float(
-                self._get_cfg("heat_settings", "cold_delay_minutes", 200) or 200
+        """Calculate the baseline delay for the selected idle greeting mode."""
+        mode = self._idle_mode()
+        if mode == "大模型判断":
+            return float(self._idle_judge_after_minutes())
+        if mode == "固定时间":
+            if profile.idle_after_minutes is not None:
+                return max(1.0, float(profile.idle_after_minutes))
+            return max(
+                1.0,
+                float(
+                    self._get_cfg("idle_greetings", "idle_after_minutes", 1200) or 1200
+                ),
             )
-            heat = self._calc_heat(st, now_ts)
-            delay_m = geometric_delay(hot_m, cold_m, heat)
-            logger.debug(f"[Spark] 热度计算: heat={heat:.2f}, delay={delay_m:.0f}m")
-            return delay_m
 
-        # heat disabled — use fixed setting
-        if profile.idle_after_minutes is not None:
-            return float(profile.idle_after_minutes)
-        return float(self._get_cfg("idle_greetings", "idle_after_minutes", 45) or 45)
+        hot_m = float(self._get_cfg("idle_greetings", "hot_delay_minutes", 30) or 30)
+        cold_m = float(
+            self._get_cfg("idle_greetings", "cold_delay_minutes", 200) or 200
+        )
+        heat = self._calc_heat(st, now_ts)
+        delay_m = geometric_delay(hot_m, cold_m, heat)
+        logger.debug(f"[Spark] 热度计算: heat={heat:.2f}, delay={delay_m:.0f}m")
+        return delay_m
 
     def _calc_fluctuated_idle_delay(
         self, st: SessionState, now_ts: float, profile: UserProfile
     ) -> float | None:
-        """Apply the configured time policy to the heat/fixed idle baseline."""
+        """Apply fixed-mode jitter while leaving model-mode timing unjittered."""
         delay_m = self._calc_idle_delay(st, now_ts, profile)
+        if self._idle_mode() != "固定时间":
+            return delay_m
+
         idle_cfg = self.cfg.get("idle_greetings") or {}
         if not isinstance(idle_cfg, dict):
             idle_cfg = {}
-        policy_config = idle_cfg
-        compact_value = idle_cfg.get("idle_random_fluctuation_minutes", 15)
+        policy_config = dict(idle_cfg)
+        compact_value = idle_cfg.get("idle_random_fluctuation_minutes", 30)
         if (
             idle_cfg.get("offset_mode") in (None, "")
             and str(compact_value).strip().isdigit()
         ):
-            policy_config = dict(idle_cfg)
-            legacy_fluctuation = max(0, int(compact_value or 0))
             policy_config["idle_random_fluctuation_minutes"] = min(
-                legacy_fluctuation,
-                max(0, int(delay_m) - 1),
+                max(0, int(compact_value or 0)), max(0, int(delay_m) - 1)
             )
         policy = parse_policy(
             policy_config,
@@ -1079,8 +1113,7 @@ class Spark(Star):
             return result.minutes
         if result.retryable:
             retry_minutes = max(
-                1,
-                int(idle_cfg.get("offset_retry_minutes", 1) or 1),
+                1, self._get_int_cfg("idle_greetings", "offset_retry_minutes", 1)
             )
             st.idle_retry_after_ts = now_ts + retry_minutes * 60
             logger.info(f"[Spark] 延时问候随机偏移结果无效，{retry_minutes} 分钟后重算")
@@ -1089,9 +1122,52 @@ class Spark(Star):
             logger.warning("[Spark] 延时问候固定偏移结果小于等于 0，本轮不安排")
         return None
 
+    def _reset_idle_schedule(
+        self, st: SessionState, now_ts: float, profile: UserProfile
+    ) -> None:
+        """Start a new idle cycle after any real user or AI activity."""
+        st.idle_judge_cycle += 1
+        st.idle_judge_checked_cycle = -1
+        st.idle_judge_inflight_cycle = -1
+        st.idle_judge_task_ts = 0.0
+        st.idle_judge_anchor_ts = now_ts
+        st.idle_retry_after_ts = 0.0
+        st.idle_schedule_mode = self._idle_mode()
+        if not profile.subscribed or not bool(
+            self._get_cfg("idle_greetings", "enable_idle_greetings", True)
+        ):
+            st.next_idle_ts = 0.0
+            return
+        delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
+        st.next_idle_ts = now_ts + delay_m * 60 if delay_m else 0.0
+
+    def _idle_judge_bounds(self) -> tuple[int, int]:
+        minimum = max(
+            1, self._get_int_cfg("idle_greetings", "judge_min_delay_minutes", 5)
+        )
+        maximum = max(
+            minimum,
+            self._get_int_cfg("idle_greetings", "judge_max_delay_minutes", 1440),
+        )
+        return minimum, maximum
+
+    @staticmethod
+    def _parse_delay_minutes(
+        response: object, minimum: int, maximum: int
+    ) -> int | None:
+        text = str(response or "").strip()
+        if not re.fullmatch(r"[0-9]+", text):
+            return None
+        value = int(text)
+        if value == 0:
+            return 0
+        if value < minimum or value > maximum:
+            return None
+        return value
+
     # 数据持久化
     def _load_user_data(self):
-        """加载用户配置和提醒事项（从 user_data.json）"""
+        """Load user profiles and ignore deprecated top-level fields."""
         if not os.path.exists(self._user_data_path):
             return
         try:
@@ -1105,26 +1181,18 @@ class Spark(Star):
                     f"[Spark] Loaded {len(self._user_profiles)} user profiles."
                 )
 
-                reminders_data = data.get("reminders", {})
-                for reminder_id, reminder_dict in reminders_data.items():
-                    self._reminders[reminder_id] = Reminder.from_dict(reminder_dict)
-                logger.debug(f"[Spark] Loaded {len(self._reminders)} reminders.")
-
         except (json.JSONDecodeError, TypeError) as e:
             logger.error(f"[Spark] Failed to load user data: {e}")
         except OSError as e:
             logger.error(f"[Spark] Failed to read user data file: {e}")
 
     def _save_user_data(self):
-        """保存用户配置和提醒事项（到 user_data.json）"""
+        """Save user profiles without serializing deprecated reminder data."""
         try:
             profiles_dict = {
                 uid: profile.to_dict() for uid, profile in self._user_profiles.items()
             }
-            reminders_dict = {
-                rid: reminder.to_dict() for rid, reminder in self._reminders.items()
-            }
-            data = {"profiles": profiles_dict, "reminders": reminders_dict}
+            data = {"profiles": profiles_dict}
             with open(self._user_data_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
         except OSError as e:
@@ -1390,19 +1458,15 @@ class Spark(Star):
                 )
                 self._sync_subscribed_users_to_config()  # 同步到配置文件
 
-        # 计算下一次延时问候触发时间（仅真实聊天消息触发，命令不重置倒计时）
+        # 真实聊天消息会使等待中的模型候选任务失效，并重新进入当前模式周期。
         if is_real_message:
-            st.idle_retry_after_ts = 0.0
             try:
-                if profile.subscribed and bool(
-                    self._get_cfg("idle_greetings", "enable_idle_greetings", True)
-                ):
-                    delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
-                    st.next_idle_ts = now_ts + delay_m * 60 if delay_m else 0.0
-                    if delay_m:
-                        logger.debug(
-                            f"[Spark] 沉寂计时刷新(消息): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}"
-                        )
+                self._reset_idle_schedule(st, now_ts, profile)
+                if st.next_idle_ts:
+                    logger.debug(
+                        f"[Spark] 沉寂计时刷新(消息): {umo}, "
+                        f"mode={st.idle_schedule_mode}, next={st.next_idle_ts:.0f}"
+                    )
             except Exception as e:
                 logger.warning(f"[Spark] 计算 next_idle_ts 失败: {e}")
 
@@ -1447,16 +1511,12 @@ class Spark(Star):
                 st.msg_timestamps = st.msg_timestamps[-100:]
             event.set_extra(self._heat_event_marker, True)
             profile = self._user_profiles.get(umo)
-            if (
-                profile
-                and profile.subscribed
-                and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True))
-            ):
-                delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
-                st.next_idle_ts = now_ts + delay_m * 60 if delay_m else 0.0
-                if delay_m:
+            if profile:
+                self._reset_idle_schedule(st, now_ts, profile)
+                if st.next_idle_ts:
                     logger.debug(
-                        f"[Spark] 沉寂计时刷新(llm_request补偿): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}"
+                        f"[Spark] 沉寂计时刷新(llm_request补偿): {umo}, "
+                        f"mode={st.idle_schedule_mode}, next={st.next_idle_ts:.0f}"
                     )
             await self._debounced_save_session_data()
         except Exception as e:
@@ -1480,21 +1540,15 @@ class Spark(Star):
             ).timestamp()
             if st:
                 st.last_ai_reply_ts = now_ts
-                # Refresh idle greeting timer on every AI response
                 profile = self._user_profiles.get(umo)
-                if (
-                    profile
-                    and profile.subscribed
-                    and bool(
-                        self._get_cfg("idle_greetings", "enable_idle_greetings", True)
-                    )
-                ):
-                    delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
-                    st.next_idle_ts = now_ts + delay_m * 60 if delay_m else 0.0
-                    if delay_m:
+                if profile:
+                    self._reset_idle_schedule(st, now_ts, profile)
+                    if st.next_idle_ts:
                         logger.debug(
-                            f"[Spark] 沉寂计时刷新(AI回复): {umo}, delay={delay_m:.0f}m, next={st.next_idle_ts:.0f}"
+                            f"[Spark] 沉寂计时刷新(AI回复): {umo}, "
+                            f"mode={st.idle_schedule_mode}, next={st.next_idle_ts:.0f}"
                         )
+                await self._debounced_save_session_data()
             enhancement_enabled = bool(
                 self._get_cfg("enhancement", "enable_enhancement", False)
             )
@@ -1866,108 +1920,6 @@ class Spark(Star):
             )
             return
 
-        # migrate-reminders 命令（管理员）
-        if sub_command == "migrate-reminders":
-            if not self._is_admin(event):
-                yield reply("错误：此命令仅限管理员使用。")
-                return
-            result = await self._migrate_reminders_to_cron()
-            yield reply(result)
-            return
-
-        # remind 命令（旧功能，推荐使用 AstrBot 原生定时提醒）
-        if sub_command == "remind":
-            if not bool(self._get_cfg("reminders_settings", "enable_reminders", True)):
-                yield reply(
-                    "提醒功能已被管理员禁用。\n💡 推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。"
-                )
-                return
-
-            remind_sub_command = args[1].lower() if len(args) > 1 else ""
-
-            if remind_sub_command == "list":
-                list_text = self._remind_list_text(event.unified_msg_origin)
-                yield reply(
-                    f"{list_text}\n\n💡 提示：推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。"
-                )
-                return
-
-            if remind_sub_command == "del" and len(args) >= 3:
-                # 支持通过序号或 ID 删除
-                identifier = args[2].strip()
-                umo = event.unified_msg_origin
-
-                # 尝试解析为序号（整数）
-                try:
-                    index = int(identifier)
-                    # 获取用户的提醒列表并排序
-                    user_reminders = self._get_user_reminders_sorted(umo)
-                    if 1 <= index <= len(user_reminders):
-                        rid = user_reminders[index - 1].id  # 序号从 1 开始
-                        del self._reminders[rid]
-                        self._save_user_data()
-                        yield reply(f"🗑️ 已删除提醒 #{index}")
-                    else:
-                        yield reply(
-                            f"❌ 序号超出范围，当前共有 {len(user_reminders)} 个提醒"
-                        )
-                    return
-                except ValueError:
-                    # 不是数字，尝试作为 ID 删除（向后兼容）
-                    rid = identifier
-                    if rid in self._reminders and self._reminders[rid].umo == umo:
-                        del self._reminders[rid]
-                        self._save_user_data()
-                        yield reply(f"🗑️ 已删除提醒 {rid}")
-                    else:
-                        yield reply(
-                            "❌ 未找到该提醒，请使用 `/conversa remind list` 查看可用序号"
-                        )
-                return
-
-            if remind_sub_command == "add":
-                remind_content = " ".join(args[2:])
-                # 匹配 HH:MM 格式
-                m_daily = re.match(r"^(\d{1,2}:\d{2})\s+(.+)$", remind_content)
-                # 匹配 YYYY-MM-DD HH:MM 格式
-                m_once = re.match(
-                    r"^(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2})\s+(.+)$", remind_content
-                )
-
-                rid = f"R{int(datetime.now().timestamp())}"
-
-                if m_once:
-                    at_time, content = m_once.groups()
-                    self._reminders[rid] = Reminder(
-                        id=rid,
-                        umo=event.unified_msg_origin,
-                        content=content.strip(),
-                        at=at_time.strip(),
-                        created_at=datetime.now().timestamp(),
-                    )
-                    self._save_user_data()
-                    yield reply(
-                        f"⏰ 已添加一次性提醒 {rid}\n💡 提示：推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。"
-                    )
-                    return
-                elif m_daily:
-                    hhmm, content = m_daily.groups()
-                    self._reminders[rid] = Reminder(
-                        id=rid,
-                        umo=event.unified_msg_origin,
-                        content=content.strip(),
-                        at=f"{hhmm}|daily",
-                        created_at=datetime.now().timestamp(),
-                    )
-                    self._save_user_data()
-                    yield reply(
-                        f"⏰ 已添加每日提醒 {rid}\n💡 提示：推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。"
-                    )
-                    return
-
-            yield reply(self._help_text())
-            return
-
         # 默认显示帮助
         yield reply(self._help_text())
 
@@ -2231,31 +2183,8 @@ class Spark(Star):
             "/灵犀 设置 免打扰 HH:MM-HH:MM - 设置免打扰时段\n"
             "/灵犀 设置 沉寂 <小时> - 设置沉寂多久后触发主动问候\n"
             "/灵犀 设置 定时1 HH:MM - 设置第一个每日问候时间\n"
-            "/灵犀 提醒 添加 <时间> <内容> - 添加提醒\n"
-            "/灵犀 提醒 列表 - 查看提醒列表\n"
-            "/灵犀 提醒 删除 <序号> - 删除提醒\n"
             "/灵犀 帮助 - 显示本帮助"
         )
-
-    def _get_user_reminders_sorted(self, umo: str) -> list[Reminder]:
-        """获取指定用户的提醒列表并排序"""
-        arr = [r for r in self._reminders.values() if r.umo == umo]
-        arr.sort(key=lambda x: x.created_at)
-        return arr
-
-    def _remind_list_text(self, umo: str) -> str:
-        """生成指定用户的提醒列表文本（显示序号）"""
-        arr = self._get_user_reminders_sorted(umo)
-        if not arr:
-            return "暂无提醒"
-        lines = []
-        for idx, r in enumerate(arr, start=1):
-            # 格式化时间显示
-            time_display = r.at.replace("|daily", " (每日)")
-            lines.append(f"{idx}. {time_display} | {r.content}")
-        # 使用换行符连接，确保每个提醒单独一行
-        # 提示信息放在末尾，避免某些消息平台过滤括号内容
-        return "提醒列表：\n" + "\n".join(lines)
 
     # 对话增强（短期随机追回复）
 
@@ -2329,30 +2258,66 @@ class Spark(Star):
             return False
 
     def _schedule_enhancement(self, umo: str, current_round: dict | None = None):
-        """Schedule one heat-scaled follow-up and leave send/no-send to the judge."""
-        hot_delay = self._get_cfg("enhancement", "enhancement_hot_delay_seconds", None)
-        cold_delay = self._get_cfg(
-            "enhancement", "enhancement_cold_delay_seconds", None
-        )
-        hot_delay = (
-            int(hot_delay)
-            if hot_delay not in (None, "")
-            else self._get_int_cfg("enhancement", "enhancement_min_delay", 45)
-        )
-        cold_delay = (
-            int(cold_delay)
-            if cold_delay not in (None, "")
-            else self._get_int_cfg("enhancement", "enhancement_max_delay", 600)
-        )
+        """Schedule a heat-scaled or fixed-policy follow-up."""
+        enhancement_cfg = self.cfg.get("enhancement") or {}
+        if not isinstance(enhancement_cfg, dict):
+            enhancement_cfg = {}
+        mode = str(enhancement_cfg.get("mode") or "对话热度").strip()
         st = self._states.get(umo)
         now_ts = _now_tz(
             self._get_cfg("basic_settings", "timezone") or None
         ).timestamp()
-        heat = self._calc_heat(st, now_ts) if st else 0.0
-        delay = heat_scaled_delay_seconds(hot_delay, cold_delay, heat)
+
+        if mode == "固定时间":
+            base_delay = max(
+                1.0,
+                float(
+                    enhancement_cfg.get(
+                        "fixed_delay_seconds",
+                        self._get_int_cfg("enhancement", "enhancement_min_delay", 45),
+                    )
+                    or 45
+                ),
+            )
+            policy = parse_policy(
+                enhancement_cfg,
+                legacy_jitter_key="fixed_random_fluctuation_seconds",
+            )
+            result = apply_seconds_policy(
+                base_delay,
+                policy,
+                seed=f"enhancement:{umo}:{now_ts:.0f}",
+            )
+            if result.minutes is None:
+                logger.info(f"[Spark] 对话增强跳过: {umo} (固定等待策略结果无效)")
+                if st:
+                    st.next_enhancement_ts = 0.0
+                return
+            delay = result.minutes
+            detail = f"mode={mode}, delay={delay:.1f}s"
+        else:
+            hot_delay = self._get_cfg(
+                "enhancement", "enhancement_hot_delay_seconds", None
+            )
+            cold_delay = self._get_cfg(
+                "enhancement", "enhancement_cold_delay_seconds", None
+            )
+            hot_delay = (
+                int(hot_delay)
+                if hot_delay not in (None, "")
+                else self._get_int_cfg("enhancement", "enhancement_min_delay", 45)
+            )
+            cold_delay = (
+                int(cold_delay)
+                if cold_delay not in (None, "")
+                else self._get_int_cfg("enhancement", "enhancement_max_delay", 600)
+            )
+            heat = self._calc_heat(st, now_ts) if st else 0.0
+            delay = float(heat_scaled_delay_seconds(hot_delay, cold_delay, heat))
+            detail = f"mode={mode}, heat={heat:.2f}, delay={delay:.1f}s"
 
         gen = self._enhancement_gen.get(umo, 0)
-        logger.info(f"[Spark] 已调度对话增强: {umo}, heat={heat:.2f}, {delay}秒后执行")
+        logger.info(f"[Spark] 已调度对话增强: {umo}, {detail}")
         task = asyncio.create_task(
             self._delayed_enhancement(umo, delay, gen, current_round=current_round)
         )
@@ -2363,7 +2328,7 @@ class Spark(Star):
     async def _delayed_enhancement(
         self,
         umo: str,
-        delay: int,
+        delay: float,
         gen: int,
         current_round: dict | None = None,
     ):
@@ -2402,7 +2367,7 @@ class Spark(Star):
             latest_chat_ts = max(
                 st.last_user_reply_ts, st.last_ai_reply_ts, st.last_proactive_reply_ts
             )
-            if latest_chat_ts > trigger_chat_ts + 1.0:
+            if latest_chat_ts > trigger_chat_ts:
                 logger.info(f"[Spark] 增强任务退出: {umo} (等待期间已有新聊天)")
                 return
             quiet = self._get_cfg("basic_settings", "quiet_hours", "") or ""
@@ -2437,6 +2402,7 @@ class Spark(Star):
                 umo,
                 tz,
                 prompt_template,
+                skip_judge=bool(self._get_cfg("enhancement", "ignore_judge", False)),
                 judge_current_round=current_round,
                 source="conversation_enhancement",
             )
@@ -2482,7 +2448,6 @@ class Spark(Star):
         3. 遍历所有已订阅的会话，检查是否需要主动回复
         4. 检查是否在免打扰时间段内
         5. 检查是否需要自动退订
-        6. 检查并触发提醒事项
         """
         # 检查插件是否已停止（框架禁用插件时会调用terminate设置此标志）
         if self._stopped:
@@ -2549,8 +2514,6 @@ class Spark(Star):
                 )
                 continue  # 继续处理下一个用户，不影响整体调度
 
-        # 检查提醒
-        await self._check_reminders(now, tz, reply_interval)
         # 调度器结束时使用去抖保存，减少磁盘I/O
         await self._debounced_save_session_data()
 
@@ -2816,6 +2779,29 @@ class Spark(Star):
                 )
         return DailyGreetingProjection(tasks=tasks, issues=issues)
 
+    async def _judge_idle_delay_minutes(self, umo: str, tz: str | None) -> int | None:
+        result = await self._judge_should_reply(umo, tz, delay_protocol=True)
+        return (
+            result if isinstance(result, int) and not isinstance(result, bool) else None
+        )
+
+    def _initialize_idle_cycle(
+        self,
+        st: SessionState,
+        profile: UserProfile,
+        now_ts: float,
+    ) -> None:
+        anchor_ts = self._latest_chat_ts(st) or float(st.last_ts or 0) or now_ts
+        st.idle_judge_cycle += 1
+        st.idle_judge_checked_cycle = -1
+        st.idle_judge_inflight_cycle = -1
+        st.idle_judge_task_ts = 0.0
+        st.idle_judge_anchor_ts = anchor_ts
+        st.idle_retry_after_ts = 0.0
+        st.idle_schedule_mode = self._idle_mode()
+        delay_m = self._calc_fluctuated_idle_delay(st, anchor_ts, profile)
+        st.next_idle_ts = anchor_ts + delay_m * 60 if delay_m else 0.0
+
     async def _check_idle_greeting(
         self,
         umo: str,
@@ -2824,113 +2810,156 @@ class Spark(Star):
         tz: str | None,
         reply_interval: int,
     ):
-        """检查并触发延时问候"""
+        """Advance one durable idle-greeting cycle."""
         if not bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-            logger.debug(f"[Spark] 沉寂问候跳过: {umo} (enable_idle_greetings=False)")
+            return
+        profile = self._user_profiles.get(umo)
+        if not st or not profile or not profile.subscribed:
             return
 
-        if not st:
-            logger.debug(f"[Spark] 沉寂问候跳过: {umo} (无SessionState)")
-            return
+        now_ts = now.timestamp()
+        mode = self._idle_mode()
+        if st.idle_schedule_mode != mode:
+            self._initialize_idle_cycle(st, profile, now_ts)
+            self._save_session_data()
 
-        # 向后兼容：如果 next_idle_ts 未设置或为0，自动初始化
-        if not st.next_idle_ts or st.next_idle_ts <= 0:
-            if st.idle_retry_after_ts < 0:
-                return
-            if st.idle_retry_after_ts and now.timestamp() < st.idle_retry_after_ts:
-                return
-            profile = self._user_profiles.get(umo)
-            if profile and profile.subscribed:
-                delay_m = self._calc_fluctuated_idle_delay(st, now.timestamp(), profile)
-                if not delay_m:
-                    await self._debounced_save_session_data()
-                    return
-
-                # Base on last activity time, but never set a timestamp already in the past
-                base_ts = st.last_ts if st.last_ts > 0 else now.timestamp()
-                computed = base_ts + delay_m * 60
-                st.next_idle_ts = (
-                    computed
-                    if computed > now.timestamp()
-                    else now.timestamp() + delay_m * 60
-                )
-                logger.info(
-                    f"[Spark] 沉寂问候初始化计时: {umo}, delay={delay_m}m, 将在 {st.next_idle_ts:.0f} 触发"
-                )
-                await self._debounced_save_session_data()
-                return  # 本次不触发，等下次检查
-
-        if now.timestamp() < st.next_idle_ts:
-            return
+        latest_activity_ts = self._latest_chat_ts(st)
+        if (
+            mode == "大模型判断"
+            and st.idle_judge_anchor_ts > 0
+            and latest_activity_ts > st.idle_judge_anchor_ts
+        ):
+            self._reset_idle_schedule(st, latest_activity_ts, profile)
+            self._save_session_data()
 
         if st.last_proactive_reply_ts > st.last_user_reply_ts:
             st.next_idle_ts = 0.0
+            st.idle_judge_task_ts = 0.0
             logger.info(f"[Spark] 沉寂问候跳过: {umo} (用户尚未回应上次主动消息)")
-            await self._debounced_save_session_data()
+            self._save_session_data()
+            return
+
+        if st.idle_retry_after_ts < 0:
+            return
+        if st.idle_retry_after_ts and now_ts < st.idle_retry_after_ts:
+            return
+
+        if mode == "大模型判断" and st.idle_judge_task_ts <= 0:
+            if st.idle_judge_checked_cycle == st.idle_judge_cycle:
+                return
+            if st.next_idle_ts <= 0:
+                anchor_ts = st.idle_judge_anchor_ts or latest_activity_ts or now_ts
+                st.next_idle_ts = anchor_ts + self._idle_judge_after_minutes() * 60
+                self._save_session_data()
+            if now_ts < st.next_idle_ts:
+                return
+
+            cycle = st.idle_judge_cycle
+            anchor_ts = st.idle_judge_anchor_ts
+            st.idle_judge_checked_cycle = cycle
+            st.idle_judge_inflight_cycle = cycle
+            st.next_idle_ts = 0.0
+            self._save_session_data()
+            delay_minutes = await self._judge_idle_delay_minutes(umo, tz)
+
+            if (
+                st.idle_judge_cycle != cycle
+                or st.idle_judge_anchor_ts != anchor_ts
+                or self._latest_chat_ts(st) > anchor_ts
+            ):
+                logger.info(f"[Spark] 沉寂延迟判断结果失效: {umo} (判断期间已有新聊天)")
+                return
+
+            st.idle_judge_inflight_cycle = -1
+            if delay_minutes is None:
+                retry_minutes = max(
+                    1,
+                    self._get_int_cfg("idle_greetings", "judge_retry_minutes", 5),
+                )
+                st.idle_judge_checked_cycle = -1
+                st.idle_retry_after_ts = now_ts + retry_minutes * 60
+                st.next_idle_ts = st.idle_retry_after_ts
+                logger.warning(
+                    f"[Spark] 沉寂延迟判断技术失败: {umo}, {retry_minutes} 分钟后重试"
+                )
+                self._save_session_data()
+                return
+
+            st.idle_retry_after_ts = 0.0
+            if delay_minutes == 0:
+                logger.info(f"[Spark] 沉寂延迟判断结束当前周期: {umo} (返回 0)")
+                self._save_session_data()
+                return
+
+            decided_at = _now_tz(tz).timestamp()
+            st.idle_judge_task_ts = decided_at + delay_minutes * 60
+            st.next_idle_ts = st.idle_judge_task_ts
+            logger.info(
+                f"[Spark] 沉寂延迟判断已创建一次性任务: {umo}, "
+                f"delay={delay_minutes}m, due={st.idle_judge_task_ts:.0f}"
+            )
+            self._save_session_data()
+            return
+
+        due_ts = st.idle_judge_task_ts if mode == "大模型判断" else st.next_idle_ts
+        if due_ts <= 0:
+            self._initialize_idle_cycle(st, profile, now_ts)
+            self._save_session_data()
+            return
+        if now_ts < due_ts:
             return
 
         cooldown_minutes = max(
-            0,
-            int(self._get_cfg("idle_greetings", "cooldown_minutes", 10) or 0),
-        )
-        latest_activity_ts = max(
-            st.last_user_reply_ts,
-            st.last_ai_reply_ts,
-            st.last_proactive_reply_ts,
+            0, self._get_int_cfg("idle_greetings", "cooldown_minutes", 10)
         )
         cooldown_until = cooldown_deadline(latest_activity_ts, cooldown_minutes)
-        if now.timestamp() < cooldown_until:
+        if now_ts < cooldown_until:
+            if mode == "大模型判断":
+                st.idle_judge_task_ts = cooldown_until
             st.next_idle_ts = cooldown_until
-            logger.info(
-                f"[Spark] 延时问候顺延: {umo} "
-                f"(聊天冷却 {cooldown_minutes} 分钟，顺延至 {cooldown_until:.0f})"
-            )
-            await self._debounced_save_session_data()
-            return
-
-        tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
-        if st.has_fired(tag):
-            logger.debug(f"[Spark] 沉寂问候跳过: {umo} (本分钟已触发 tag={tag})")
+            self._save_session_data()
             return
 
         idle_prompts = self._get_cfg("idle_greetings", "idle_prompt_templates") or []
         if not idle_prompts:
-            logger.warning(
-                f"[Spark] 沉寂问候跳过: {umo} (idle_prompt_templates 未配置)"
-            )
+            logger.warning(f"[Spark] 沉寂问候跳过: {umo} (未配置问候模板)")
             return
 
-        prompt_template = random.choice(idle_prompts)
-        logger.info(f"[Spark] 触发延时问候 {umo}")
+        tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
+        if st.has_fired(tag):
+            return
+        skip_judge = mode == "大模型判断" or bool(
+            self._get_cfg("idle_greetings", "ignore_judge", False)
+        )
+        logger.info(f"[Spark] 触发沉寂问候: {umo}, mode={mode}")
         ok = await self._proactive_reply(
             umo,
             tz,
-            prompt_template,
+            random.choice(idle_prompts),
+            skip_judge=skip_judge,
             source="silence_greeting",
         )
         st.mark_fired(tag)
         if ok:
             st.next_idle_ts = 0.0
+            st.idle_judge_task_ts = 0.0
+            self._save_session_data()
             if reply_interval > 0:
                 await asyncio.sleep(reply_interval)
+            return
+
+        st.consecutive_no_reply_count += 1
+        retry_minutes = max(
+            1, self._get_int_cfg("idle_greetings", "judge_retry_minutes", 5)
+        )
+        retry_at = _now_tz(tz).timestamp() + retry_minutes * 60
+        if mode == "大模型判断":
+            st.idle_judge_task_ts = retry_at
+            st.next_idle_ts = retry_at
         else:
-            st.consecutive_no_reply_count += 1
-            profile = self._user_profiles.get(umo)
-            if profile and profile.subscribed:
-                retry_now_ts = _now_tz(tz).timestamp()
-                retry_delay_m = self._calc_fluctuated_idle_delay(
-                    st, retry_now_ts, profile
-                )
-                if retry_delay_m:
-                    st.next_idle_ts = retry_now_ts + retry_delay_m * 60
-                    logger.info(
-                        f"[Spark] 沉寂问候未发送，重新计时: {umo}, "
-                        f"delay={retry_delay_m}m, 将在 {st.next_idle_ts:.0f} 触发"
-                    )
-                else:
-                    st.next_idle_ts = 0.0
-            else:
-                st.next_idle_ts = 0.0
+            retry_delay_m = self._calc_fluctuated_idle_delay(st, now_ts, profile)
+            st.next_idle_ts = now_ts + retry_delay_m * 60 if retry_delay_m else retry_at
+        self._save_session_data()
 
     async def _check_daily_greetings(
         self,
@@ -3189,87 +3218,6 @@ class Spark(Star):
 
         return False
 
-    async def _check_reminders(
-        self, now: datetime, tz: str | None, reply_interval: int
-    ):
-        """检查并触发到期的提醒事项"""
-        if not bool(self._get_cfg("reminders_settings", "enable_reminders", True)):
-            return
-
-        fired_ids = []
-        for rid, r in list(self._reminders.items()):
-            try:
-                # 检查用户订阅状态
-                profile = self._user_profiles.get(r.umo)
-                if not profile or not profile.subscribed:
-                    continue
-
-                st = self._states.get(r.umo)
-                if not st:
-                    logger.warning(
-                        f"[Spark] Reminder check skipped for {r.umo}: no session state found."
-                    )
-                    continue
-
-                if "|daily" in r.at:
-                    hhmm = r.at.split("|", 1)[0]
-                    t = _parse_hhmm(hhmm)
-                    if not t:
-                        continue
-
-                    if now.hour == t[0] and now.minute == t[1]:
-                        # 为每日提醒创建唯一标记（每天一个）
-                        tag = f"remind_daily_{r.id}@{now.strftime('%Y-%m-%d')}"
-                        if not st.has_fired(tag):
-                            logger.info(
-                                f"[Spark] Firing daily reminder {r.id} for {r.umo}"
-                            )
-                            ok = await self._proactive_reminder_reply(r.umo, r.content)
-                            if ok:
-                                st.mark_fired(tag)  # 记录已触发
-                                if reply_interval > 0:
-                                    await asyncio.sleep(reply_interval)
-                else:
-                    # 一次性提醒：比较时间字符串（精确到分钟）
-                    try:
-                        # 使用字符串比较，避免时区问题
-                        reminder_time_str = r.at  # 格式: "YYYY-MM-DD HH:MM"
-                        now_time_str = now.strftime("%Y-%m-%d %H:%M")
-
-                        # 使用字符串比较，当前时间 >= 提醒时间即触发
-                        if now_time_str >= reminder_time_str:
-                            # 为一次性提醒创建唯一标记（防止重复）
-                            tag = f"remind_once_{r.id}@{reminder_time_str}"
-                            if not st.has_fired(tag):
-                                logger.info(
-                                    f"[Spark] Firing one-time reminder {r.id} for {r.umo} (due: {r.at}, now: {now_time_str})"
-                                )
-                                ok = await self._proactive_reminder_reply(
-                                    r.umo, r.content
-                                )
-                                # 无论发送成功与否，一次性提醒都应该被删除，避免无限重试
-                                st.mark_fired(tag)
-                                fired_ids.append(rid)
-                                if not ok:
-                                    logger.warning(
-                                        f"[Spark] One-time reminder {r.id} failed to send, but will be deleted to prevent infinite retry"
-                                    )
-                                if reply_interval > 0:
-                                    await asyncio.sleep(reply_interval)
-                    except Exception as e:
-                        logger.warning(
-                            f"[Spark] Error processing one-time reminder {r.id}: {e}"
-                        )
-                        continue
-            except Exception as e:
-                logger.error(f"[Spark] Error checking reminder {r.id}: {e}")
-                continue
-
-        if fired_ids:
-            for rid in fired_ids:
-                self._reminders.pop(rid, None)
-            self._save_user_data()
-
     # 主动回复
 
     def _format_contexts_for_prompt(self, contexts: list, limit: int = 12) -> str:
@@ -3336,16 +3284,22 @@ class Spark(Star):
             return []
         return normalize_provider_ids(provider_settings.get("fallback_chat_models", []))
 
-    def _get_judge_providers(self, umo: str) -> list:
+    def _get_judge_providers(self, umo: str, *, delay_protocol: bool = False) -> list:
+        if delay_protocol:
+            group_key = "idle_greetings"
+            primary_key = "idle_judge_provider"
+            fallback_key = "idle_judge_fallback_providers"
+            purpose = "沉寂判断"
+        else:
+            group_key = "proactive_settings"
+            primary_key = "proactive_judge_provider"
+            fallback_key = "proactive_judge_fallback_providers"
+            purpose = "判断"
         return self._resolve_provider_chain(
             umo=umo,
-            primary_id=self._get_cfg(
-                "proactive_settings", "proactive_judge_provider", ""
-            ),
-            fallback_ids=self._get_cfg(
-                "proactive_settings", "proactive_judge_fallback_providers", []
-            ),
-            purpose="判断",
+            primary_id=self._get_cfg(group_key, primary_key, ""),
+            fallback_ids=self._get_cfg(group_key, fallback_key, []),
+            purpose=purpose,
         )
 
     def _get_gen_providers(self, umo: str) -> list:
@@ -3395,8 +3349,10 @@ class Spark(Star):
         umo: str,
         tz: str | None,
         current_round: dict | None = None,
-    ) -> bool:
-        """Step 1: Lightweight LLM call to decide whether to send a proactive reply."""
+        *,
+        delay_protocol: bool = False,
+    ) -> bool | int | None:
+        """Run the shared judge context with yes/no or strict delay output."""
         try:
             await self._refresh_realtime_context()
             now = _now_tz(tz)
@@ -3491,24 +3447,42 @@ class Spark(Star):
                 f"content={self._format_context_tail_for_log(judge_contexts, limit=len(judge_contexts))}"
             )
 
-            judge_template = (
-                self._get_cfg("proactive_settings", "proactive_judge_prompt") or ""
+            judge_group = "idle_greetings" if delay_protocol else "proactive_settings"
+            judge_prompt_key = (
+                "idle_judge_prompt" if delay_protocol else "proactive_judge_prompt"
             )
+            judge_rules_key = (
+                "idle_judge_rules" if delay_protocol else "proactive_judge_rules"
+            )
+            judge_template = self._get_cfg(judge_group, judge_prompt_key) or ""
             if not judge_template:
                 judge_template = (
                     "日程：{today_schedule}\n当前活动：{current_activity}\n"
                     "用户节律：{time_period_prompt}\n内心世界：\n{emotion_state}\n"
-                    "距上次聊天：{time_since_last_chat}"
+                    "距上次聊天：{time_since_last_chat}\n"
+                    "最近用户消息：{last_user}\n最近AI回复：{last_ai}\n\n"
+                    "判断下一次主动联系的等待分钟数。明确承诺或日程后续通常 5~90 分钟；"
+                    "未完成话题通常 15~60 分钟；普通沉寂通常 120~180 分钟；"
+                    "没有合适联系理由或当前不宜打扰时返回 0。"
+                    if delay_protocol
+                    else (
+                        "日程：{today_schedule}\n当前活动：{current_activity}\n"
+                        "用户节律：{time_period_prompt}\n内心世界：\n{emotion_state}\n"
+                        "距上次聊天：{time_since_last_chat}\n"
+                        "最近用户消息：{last_user}\n最近AI回复：{last_ai}"
+                    )
                 )
             elif "{emotion_state}" not in judge_template:
                 judge_template = (
                     f"{judge_template.rstrip()}\n内心世界：\n{{emotion_state}}"
                 )
-            judge_rules = (
-                self._get_cfg("proactive_settings", "proactive_judge_rules") or ""
-            )
+            judge_rules = self._get_cfg(judge_group, judge_rules_key) or ""
             if not judge_rules:
-                judge_rules = '！！必须遵守！！：你只能输出一个字："是"或"否"，不允许输出任何其他字。'
+                judge_rules = (
+                    "只能输出一个非负整数分钟数，不得输出任何其他内容。"
+                    if delay_protocol
+                    else '！！必须遵守！！：你只能输出一个字："是"或"否"，不允许输出任何其他字。'
+                )
             today_schedule = getattr(self.context, "_busy_schedule_today_schedule", "")
             outfit = getattr(self.context, "_busy_schedule_outfit", "")
             current_activity = getattr(
@@ -3555,10 +3529,14 @@ class Spark(Star):
                 },
             )
 
-            providers = self._get_judge_providers(umo)
+            providers = self._get_judge_providers(
+                umo,
+                delay_protocol=delay_protocol,
+            )
             if not providers:
-                logger.warning(f"[Spark] 判断模型链为空({umo})，默认允许主动回复")
-                return True
+                message = "判断模型链为空"
+                logger.warning(f"[Spark] {message}({umo})")
+                return None if delay_protocol else True
 
             judge_persona = self._resolve_persona(
                 "proactive_settings", "judge_persona_id"
@@ -3566,7 +3544,11 @@ class Spark(Star):
             if not judge_persona:
                 judge_persona = await self._get_current_persona_prompt(umo)
             if not judge_persona:
-                judge_persona = "你是一个对话判断助手，只回复是或否"
+                judge_persona = (
+                    "你是一个严格的对话判断助手，只输出非负整数分钟数"
+                    if delay_protocol
+                    else "你是一个对话判断助手，只回复是或否"
+                )
 
             judge_retries = 3
             last_err = None
@@ -3595,6 +3577,21 @@ class Spark(Star):
                         if not response:
                             raise ValueError("Empty completion text")
 
+                        if delay_protocol:
+                            minimum, maximum = self._idle_judge_bounds()
+                            delay_minutes = self._parse_delay_minutes(
+                                response, minimum, maximum
+                            )
+                            if delay_minutes is None:
+                                raise ValueError(
+                                    f"Invalid delay protocol response: {response[:40]!r}"
+                                )
+                            logger.info(
+                                f"[Spark] Judge delay for {umo} via {provider_id}: "
+                                f"{delay_minutes} minutes"
+                            )
+                            return delay_minutes
+
                         should_reply = "是" in response[:10]
                         result = "YES" if should_reply else "NO"
                         logger.info(
@@ -3610,6 +3607,7 @@ class Spark(Star):
                             any(code in err_str for code in ("502", "503", "504"))
                             or "no usable output" in err_str
                             or "empty" in err_str
+                            or "invalid delay protocol" in err_str
                             or "timeout" in err_str
                             or "connect" in err_str
                         )
@@ -3626,16 +3624,12 @@ class Spark(Star):
                         )
                         break
 
-            logger.error(
-                f"[Spark] 所有判断模型均失败({umo}): {last_err}，默认允许主动回复"
-            )
-            return True
+            logger.error(f"[Spark] 所有判断模型均失败({umo}): {last_err}")
+            return None if delay_protocol else True
 
         except Exception as e:
-            logger.error(
-                f"[Spark] Judge unexpected error({umo}): {e}, defaulting to allow"
-            )
-            return True
+            logger.error(f"[Spark] Judge unexpected error({umo}): {e}")
+            return None if delay_protocol else True
 
     def _resolve_persona(self, *config_keys) -> str:
         """Resolve persona_id from config to system_prompt via persona_mgr."""
@@ -4721,115 +4715,6 @@ class Spark(Star):
         logger.error(f"[Spark] 所有生成模型均失败({umo}): {last_err}")
         return None
 
-    async def _proactive_reminder_reply(self, umo: str, reminder_content: str) -> bool:
-        """
-        执行由 AI 生成的主动提醒回复
-
-        v3 改造：复用 _run_agent_pipeline / _run_legacy_llm，走合规调用。
-        """
-        try:
-            tz = self._get_cfg("basic_settings", "timezone") or None
-            now = _now_tz(tz)
-            time_fmt = (
-                self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M"
-            )
-            now_str = now.strftime(time_fmt)
-
-            st = self._states.get(umo)
-            time_since_last_chat = "未知"
-            if st:
-                _last_chat_ts = max(
-                    st.last_user_reply_ts,
-                    st.last_proactive_reply_ts,
-                    st.last_ai_reply_ts,
-                )
-                if _last_chat_ts > 0:
-                    time_since_last_chat = _format_time_delta(
-                        now.timestamp() - _last_chat_ts
-                    )
-
-            last_user, last_ai = await self._get_last_messages(umo)
-
-            # 使用提醒 prompt 模板
-            template = (
-                self._get_cfg("reminders_settings", "reminder_prompt_template")
-                or "用户提醒：{reminder_content}"
-            )
-            try:
-                prompt = template.format(
-                    reminder_content=reminder_content,
-                    now=now_str,
-                    umo=umo,
-                    time_since_last_chat=time_since_last_chat,
-                    last_user=last_user,
-                    last_ai=last_ai,
-                )
-            except KeyError as e:
-                logger.warning(
-                    f"[Spark] 提醒模板格式化失败，未知占位符: {e}，使用默认模板"
-                )
-                prompt = f"用户提醒：{reminder_content}"
-
-            logger.info(f"[Spark] 触发 AI 提醒 for {umo}: {reminder_content}")
-
-            gen_provider = self._get_gen_provider(umo)
-            gen_persona = await self._get_gen_persona(umo)
-
-            if HAS_AGENT_PIPELINE:
-                response_text = await self._run_agent_pipeline(
-                    umo, prompt, tz, provider=gen_provider, persona=gen_persona
-                )
-            else:
-                logger.error(
-                    f"[Spark] Agent Pipeline 不可用，主动对话退回旧路径；"
-                    f"知识库、记忆 hook 与框架上下文裁剪不会生效。"
-                    f"import_error={AGENT_PIPELINE_IMPORT_ERROR}"
-                )
-                response_text = await self._run_legacy_llm(
-                    umo, prompt, provider=gen_provider, persona=gen_persona
-                )
-
-            if not response_text:
-                return False
-
-            if not getattr(self, "_last_cron_event_sent", False):
-                if not await self._send_text(umo, response_text):
-                    return False
-            logger.info(f"[Spark] 已发送 AI 提醒给 {umo}: {response_text[:50]}...")
-
-            # Save history only for legacy path; agent pipeline saves history in _run_agent_pipeline.
-            if not HAS_AGENT_PIPELINE:
-                try:
-                    conv_mgr = self.context.conversation_manager
-                    curr_cid = await conv_mgr.get_curr_conversation_id(umo)
-                    if curr_cid:
-                        reminder = self._fallback_datetime_reminder(umo, tz)
-                        await self._add_message_pair_to_history(
-                            umo,
-                            curr_cid,
-                            None,
-                            build_proactive_user_content(
-                                self._proactive_placeholder(), reminder
-                            ),
-                            response_text,
-                        )
-                except Exception as e:
-                    logger.warning(f"[Spark] 保存提醒历史失败: {e}")
-
-            self._record_proactive_delivery(
-                umo,
-                source="scheduled_reminder",
-                sent_at=_now_tz(tz).timestamp(),
-                response_text=response_text,
-            )
-            await self._debounced_save_session_data()
-
-            return True
-
-        except Exception as e:
-            logger.error(f"[Spark] proactive reminder error({umo}): {e}", exc_info=True)
-            return False
-
     async def _add_message_pair_to_history(
         self,
         umo: str,
@@ -5090,10 +4975,6 @@ class Spark(Star):
         except Exception as e:
             logger.error(f"[Spark] ❌ 发送消息失败({umo}): {e}")
             return False
-
-    async def _send_reminder_message(self, umo: str, text: str):
-        """发送提醒消息到指定会话"""
-        await self._send_text(umo, text)
 
     # 生命周期管理
     async def terminate(self):

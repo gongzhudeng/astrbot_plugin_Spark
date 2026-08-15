@@ -5,6 +5,7 @@ from core.time_policy import (
     TimePolicy,
     apply_datetime_policy,
     apply_delay_policy,
+    apply_seconds_policy,
     choose_offset_minutes,
     cooldown_deadline,
     migrate_compact_policy_values,
@@ -60,6 +61,7 @@ def test_explicit_legacy_fields_still_take_priority():
 def test_migrate_compact_policy_values_converts_all_legacy_integers():
     config = {
         "idle_greetings": {"idle_random_fluctuation_minutes": 2},
+        "enhancement": {"fixed_random_fluctuation_seconds": 20},
         "daily_prompts": {
             "daily_greetings": [
                 {"enable": False, "jitter_minutes": 13},
@@ -70,6 +72,7 @@ def test_migrate_compact_policy_values_converts_all_legacy_integers():
 
     assert migrate_compact_policy_values(config) is True
     assert config["idle_greetings"]["idle_random_fluctuation_minutes"] == "2"
+    assert config["enhancement"]["fixed_random_fluctuation_seconds"] == "20"
     assert config["daily_prompts"]["daily_greetings"][0]["jitter_minutes"] == "13"
     assert migrate_compact_policy_values(config) is False
 
@@ -116,3 +119,25 @@ def test_invalid_fixed_delay_ends_current_round():
     )
     assert result.minutes is None
     assert result.retryable is False
+
+
+def test_second_based_fixed_delay_uses_same_offset_grammar():
+    result = apply_seconds_policy(
+        120,
+        TimePolicy(OffsetMode.FIXED_DELAY, minutes=30),
+        seed="enhancement-fixed",
+    )
+    assert result.minutes == 150
+    assert result.retryable is False
+
+
+def test_second_based_random_delay_is_stable_for_same_seed():
+    policy = TimePolicy(
+        OffsetMode.CUSTOM_RANGE,
+        minimum_minutes=-20,
+        maximum_minutes=40,
+    )
+    first = apply_seconds_policy(120, policy, seed="enhancement-stable")
+    second = apply_seconds_policy(120, policy, seed="enhancement-stable")
+    assert first == second
+    assert first.is_valid

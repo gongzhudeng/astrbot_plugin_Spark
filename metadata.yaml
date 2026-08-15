@@ -2,5 +2,5 @@ name: astrbot_plugin_Spark
 display_name: 灵犀 · 主动对话
 author: 灵犀
 desc: 让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候
-version: 2.5.4
+version: 2.6.0
 repo: https://github.com/gongzhudeng/astrbot_plugin_Spark

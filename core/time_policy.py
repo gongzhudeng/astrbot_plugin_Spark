@@ -154,14 +154,30 @@ def apply_delay_policy(
     return DelayResult(None, retryable=policy.is_random)
 
 
+def apply_seconds_policy(
+    base_seconds: float, policy: TimePolicy, *, seed: str
+) -> DelayResult:
+    """Apply the same compact offset grammar to second-based delays."""
+    result = float(base_seconds) + choose_offset_minutes(policy, seed=seed)
+    if result > 0:
+        return DelayResult(result)
+    return DelayResult(None, retryable=policy.is_random)
+
+
 def migrate_compact_policy_values(config: dict) -> bool:
     """Convert legacy numeric policy values to the schema's compact strings."""
     changed = False
-    idle = config.get("idle_greetings")
-    if isinstance(idle, dict):
-        value = idle.get("idle_random_fluctuation_minutes")
+    compact_fields = (
+        ("idle_greetings", "idle_random_fluctuation_minutes"),
+        ("enhancement", "fixed_random_fluctuation_seconds"),
+    )
+    for group_key, field_key in compact_fields:
+        group = config.get(group_key)
+        if not isinstance(group, dict):
+            continue
+        value = group.get(field_key)
         if isinstance(value, int) and not isinstance(value, bool):
-            idle["idle_random_fluctuation_minutes"] = str(value)
+            group[field_key] = str(value)
             changed = True
 
     daily = config.get("daily_prompts")
