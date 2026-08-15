@@ -129,6 +129,12 @@
         "type": "bool",
         "default": true
       },
+      "require_user_reply_before_idle_greeting": {
+        "description": "等待用户回复后再沉寂问候",
+        "hint": "打开后，上一条主动消息未获用户回复时，不再发起新的沉寂问候或沉寂判断；关闭后仍按所选模式继续安排。",
+        "type": "bool",
+        "default": true
+      },
       "mode": {
         "description": "沉寂问候模式",
         "hint": "三种模式互斥：对话热度根据聊天密度安排；固定时间按基准时间安排；大模型判断在无聊天达到阈值后让模型决定多少分钟后再联系。",

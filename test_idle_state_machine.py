@@ -16,6 +16,7 @@ def _plugin(mode: str = "大模型判断") -> tuple[Spark, SessionState, UserPro
     plugin.cfg = {
         "idle_greetings": {
             "enable_idle_greetings": True,
+            "require_user_reply_before_idle_greeting": True,
             "mode": mode,
             "ignore_judge": False,
             "idle_after_minutes": 120,
@@ -128,6 +129,35 @@ def test_new_activity_invalidates_candidate_and_starts_new_cycle():
     assert state.idle_judge_task_ts == 0.0
     assert state.idle_judge_anchor_ts == 2_000.0
     assert state.next_idle_ts == 5_600.0
+
+
+@pytest.mark.asyncio
+async def test_unanswered_proactive_reply_blocks_idle_judgement_by_default():
+    plugin, state, _ = _plugin()
+    state.last_proactive_reply_ts = 2_000.0
+    state.next_idle_ts = 1_000.0
+
+    await plugin._check_idle_greeting(UMO, state, _at(4_600.0), "UTC", 0)
+
+    plugin._judge_idle_delay_minutes.assert_not_awaited()
+    assert state.next_idle_ts == 0.0
+    assert state.idle_judge_task_ts == 0.0
+
+
+@pytest.mark.asyncio
+async def test_idle_judgement_can_continue_without_a_user_reply_when_configured():
+    plugin, state, _ = _plugin()
+    plugin.cfg["idle_greetings"]["require_user_reply_before_idle_greeting"] = False
+    plugin._judge_idle_delay_minutes.return_value = 20
+    state.last_proactive_reply_ts = 2_000.0
+    state.idle_judge_anchor_ts = 2_000.0
+    state.next_idle_ts = 5_600.0
+
+    await plugin._check_idle_greeting(UMO, state, _at(5_600.0), "UTC", 0)
+
+    plugin._judge_idle_delay_minutes.assert_awaited_once_with(UMO, "UTC")
+    assert state.idle_judge_task_ts > 0
+    assert state.next_idle_ts == state.idle_judge_task_ts
 
 
 @pytest.mark.asyncio

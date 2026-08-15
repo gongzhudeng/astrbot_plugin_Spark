@@ -555,7 +555,7 @@ class DailyGreetingProjection:
     "astrbot_plugin_Spark",
     "灵犀 · 主动对话",
     "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候",
-    "2.6.0",
+    "2.6.2",
     "https://github.com/gongzhudeng/astrbot_plugin_Spark",
 )
 class Spark(Star):
@@ -2832,7 +2832,14 @@ class Spark(Star):
             self._reset_idle_schedule(st, latest_activity_ts, profile)
             self._save_session_data()
 
-        if st.last_proactive_reply_ts > st.last_user_reply_ts:
+        if (
+            bool(
+                self._get_cfg(
+                    "idle_greetings", "require_user_reply_before_idle_greeting", True
+                )
+            )
+            and st.last_proactive_reply_ts > st.last_user_reply_ts
+        ):
             st.next_idle_ts = 0.0
             st.idle_judge_task_ts = 0.0
             logger.info(f"[Spark] 沉寂问候跳过: {umo} (用户尚未回应上次主动消息)")
@@ -4594,8 +4601,7 @@ class Spark(Star):
         if result.reset_coro:
             await result.reset_coro
 
-        async for _ in runner.step_until_done(30):
-            pass
+        delivered_texts = await self._consume_agent_responses(umo, runner)
 
         llm_resp = runner.get_final_llm_resp()
         delivery = resolve_agent_delivery(
@@ -4603,6 +4609,7 @@ class Spark(Star):
             has_send_operation=getattr(cron_event, "_has_send_oper", False),
             direct_history_text=cron_event.get_extra(DIRECT_DELIVERY_TEXT_EXTRA, ""),
             direct_delivery_kind=cron_event.get_extra(DIRECT_DELIVERY_KIND_EXTRA, ""),
+            delivered_texts=tuple(delivered_texts),
         )
         if delivery is None:
             logger.debug(f"[Spark] Agent 无响应且未发送消息: {umo}")
@@ -4632,6 +4639,34 @@ class Spark(Star):
             logger.warning(f"[Spark] 保存对话历史失败: {e}")
 
         return delivery
+
+    async def _consume_agent_responses(self, umo: str, runner) -> list[str]:
+        delivered_texts: list[str] = []
+        async for agent_response in runner.step_until_done(30):
+            await self._send_visible_agent_text(umo, agent_response, delivered_texts)
+        return delivered_texts
+
+    async def _send_visible_agent_text(
+        self,
+        umo: str,
+        agent_response,
+        delivered_texts: list[str],
+    ) -> None:
+        if getattr(agent_response, "type", "") != "llm_result":
+            return
+
+        response_data = getattr(agent_response, "data", {}) or {}
+        chain = response_data.get("chain")
+        if chain is None or getattr(chain, "type", None) == "reasoning":
+            return
+
+        text = str(chain.get_plain_text() or "").strip()
+        if not text or text in delivered_texts:
+            return
+
+        if await self._send_text(umo, text):
+            delivered_texts.append(text)
+            logger.info(f"[Spark] 已提前发送 Agent 文本给 {umo}: {text[:50]}...")
 
     async def _run_legacy_llm(
         self, umo: str, prompt: str, provider=None, persona: str = ""
