@@ -10,6 +10,9 @@ from data.plugins.astrbot_plugin_Spark.core.proactive_delivery import (
     resolve_agent_delivery,
 )
 from data.plugins.astrbot_plugin_Spark.main import Spark
+from data.plugins.astrbot_plugin_thinking_cleaner.core.sanitizer import (
+    clean_thinking_text,
+)
 
 
 def test_text_completion_requires_normal_delivery():
@@ -131,6 +134,107 @@ async def test_visible_agent_text_is_sent_once_and_ignores_reasoning():
     plugin._send_text.assert_awaited_once_with(
         "default:FriendMessage:1", "我开饭啦，给你拍张看看。"
     )
+
+
+@pytest.mark.asyncio
+async def test_visible_agent_text_is_cleaned_before_delivery():
+    plugin = Spark.__new__(Spark)
+    plugin.context = SimpleNamespace(_thinking_cleaner_clean_text=clean_thinking_text)
+    plugin._send_text = AsyncMock(return_value=True)
+    delivered: list[str] = []
+    response = SimpleNamespace(
+        type="llm_result",
+        data={
+            "chain": MessageChain().message(
+                "<tag>\n豆包工具轮次推理</thinking>\n给你的回复"
+            )
+        },
+    )
+
+    await plugin._send_visible_agent_text(
+        "default:FriendMessage:1", response, delivered
+    )
+
+    assert delivered == ["给你的回复"]
+    plugin._send_text.assert_awaited_once_with("default:FriendMessage:1", "给你的回复")
+
+
+@pytest.mark.asyncio
+async def test_proactive_history_is_cleaned_before_persistence():
+    plugin = Spark.__new__(Spark)
+    conversation = SimpleNamespace(history=[])
+    conversation_manager = SimpleNamespace(
+        get_conversation=AsyncMock(return_value=conversation),
+        update_conversation=AsyncMock(),
+    )
+    plugin.context = SimpleNamespace(
+        _thinking_cleaner_clean_text=clean_thinking_text,
+        conversation_manager=conversation_manager,
+    )
+    plugin._proactive_placeholder = MagicMock(return_value="[主动轮]")
+    plugin._remove_internal_history_tail = AsyncMock(return_value=0)
+
+    await plugin._save_standard_proactive_history(
+        "default:FriendMessage:1",
+        "conversation",
+        "<tag>\n豆包最终轮次推理</thinking>\n给你的回复",
+        0,
+    )
+
+    persisted = conversation_manager.update_conversation.await_args.kwargs["history"]
+    assert persisted[-1] == {"role": "assistant", "content": "给你的回复"}
+
+
+def test_final_delivery_uses_cleaned_response_and_history_text():
+    plugin = Spark.__new__(Spark)
+    plugin.context = SimpleNamespace(_thinking_cleaner_clean_text=clean_thinking_text)
+    source = "<tag>\n豆包最终轮次推理</thinking>\n给你的回复"
+
+    delivery = resolve_agent_delivery(
+        plugin._clean_output_text(source),
+        has_send_operation=False,
+    )
+
+    assert delivery is not None
+    assert delivery.response_text == "给你的回复"
+    assert delivery.history_text == "给你的回复"
+
+
+def test_missing_cleaner_keeps_spark_output_unchanged():
+    plugin = Spark.__new__(Spark)
+    plugin.context = SimpleNamespace()
+    source = "<tag>\n豆包内部推理</thinking>\n给你的回复"
+
+    assert plugin._clean_output_text(source) == source
+
+
+@pytest.mark.asyncio
+async def test_legacy_generation_returns_cleaned_text(monkeypatch):
+    plugin = Spark.__new__(Spark)
+    provider = SimpleNamespace(
+        provider_config={"id": "doubao"},
+        text_chat=AsyncMock(
+            return_value=SimpleNamespace(
+                completion_text=("<tag>\n豆包旧路径推理</thinking>\n给你的回复")
+            )
+        ),
+    )
+    plugin.context = SimpleNamespace(_thinking_cleaner_clean_text=clean_thinking_text)
+    plugin._get_gen_providers = MagicMock(return_value=[provider])
+    plugin._get_gen_persona = AsyncMock(return_value="")
+    plugin._get_conversation_contexts = AsyncMock(return_value=[])
+    plugin._format_context_tail_for_log = MagicMock(return_value="")
+    monkeypatch.setattr(
+        "data.plugins.astrbot_plugin_Spark.main.HAS_REQUEST_HOOKS",
+        False,
+    )
+
+    result = await plugin._run_legacy_llm(
+        "default:FriendMessage:1",
+        "继续聊天",
+    )
+
+    assert result == "给你的回复"
 
 
 @pytest.mark.asyncio

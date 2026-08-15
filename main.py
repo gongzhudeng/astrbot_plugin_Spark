@@ -555,7 +555,7 @@ class DailyGreetingProjection:
     "astrbot_plugin_Spark",
     "灵犀 · 主动对话",
     "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候",
-    "2.6.2",
+    "2.6.3",
     "https://github.com/gongzhudeng/astrbot_plugin_Spark",
 )
 class Spark(Star):
@@ -4394,6 +4394,7 @@ class Spark(Star):
         baseline_len: int,
         datetime_reminder: str = "",
     ) -> None:
+        assistant_response = self._clean_output_text(assistant_response)
         if not conversation_id or not assistant_response:
             return
         placeholder = self._proactive_placeholder()
@@ -4605,9 +4606,13 @@ class Spark(Star):
 
         llm_resp = runner.get_final_llm_resp()
         delivery = resolve_agent_delivery(
-            getattr(llm_resp, "completion_text", "") if llm_resp else "",
+            self._clean_output_text(
+                getattr(llm_resp, "completion_text", "") if llm_resp else ""
+            ),
             has_send_operation=getattr(cron_event, "_has_send_oper", False),
-            direct_history_text=cron_event.get_extra(DIRECT_DELIVERY_TEXT_EXTRA, ""),
+            direct_history_text=self._clean_output_text(
+                cron_event.get_extra(DIRECT_DELIVERY_TEXT_EXTRA, "")
+            ),
             direct_delivery_kind=cron_event.get_extra(DIRECT_DELIVERY_KIND_EXTRA, ""),
             delivered_texts=tuple(delivered_texts),
         )
@@ -4660,7 +4665,7 @@ class Spark(Star):
         if chain is None or getattr(chain, "type", None) == "reasoning":
             return
 
-        text = str(chain.get_plain_text() or "").strip()
+        text = self._clean_output_text(chain.get_plain_text())
         if not text or text in delivered_texts:
             return
 
@@ -4738,8 +4743,9 @@ class Spark(Star):
                     if hasattr(llm_resp, "completion_text")
                     else ""
                 )
-                if text and text.strip():
-                    return text.strip()
+                text = self._clean_output_text(text)
+                if text:
+                    return text
                 raise ValueError("Empty completion text")
             except Exception as exc:
                 last_err = exc
@@ -4764,6 +4770,9 @@ class Spark(Star):
         注意：走 build_main_agent 的主动回复会在 _run_agent_pipeline 中保存历史，
         此方法仅用于降级路径或其他需要手动追加历史的场景。
         """
+        assistant_response = self._clean_output_text(assistant_response)
+        if not assistant_response:
+            return
         try:
             if not conversation_id:
                 logger.warning("[Spark] conversation_id 为空，无法更新历史")
@@ -4972,8 +4981,25 @@ class Spark(Star):
             logger.warning(f"[Spark] 分段处理失败，使用原始文本: {e}")
             return [text]
 
+    def _clean_output_text(self, value: object) -> str:
+        text = str(value or "").strip()
+        context = getattr(self, "context", None)
+        cleaner = getattr(context, "_thinking_cleaner_clean_text", None)
+        if not callable(cleaner):
+            return text
+        try:
+            return str(cleaner(text) or "").strip()
+        except Exception as exc:
+            logger.warning(
+                f"[Spark] Thinking cleanup failed; using original text: {exc}"
+            )
+            return text
+
     async def _send_text(self, umo: str, text: str) -> bool:
         """发送主动回复消息到指定会话"""
+        text = self._clean_output_text(text)
+        if not text:
+            return False
         try:
             # 检查 umo 是否缺少 session_id（例如：platform:MessageType:None）
             # 如果是，尝试从 conversation_manager 获取完整的 umo
