@@ -561,7 +561,7 @@ class DailyGreetingProjection:
     "astrbot_plugin_Spark",
     "灵犀 · 主动对话",
     "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候",
-    "2.7.0",
+    "2.7.1",
     "https://github.com/gongzhudeng/astrbot_plugin_Spark",
 )
 class Spark(Star):
@@ -627,6 +627,9 @@ class Spark(Star):
 
         self._user_data_path = os.path.join(self._data_dir, "user_data.json")
         self._session_data_path = os.path.join(self._data_dir, "session_data.json")
+        self._config_migration_path = os.path.join(
+            self._data_dir, "config_migrations.json"
+        )
 
         # 加载数据
         self._load_user_data()
@@ -806,7 +809,15 @@ class Spark(Star):
             idle = self.cfg.get("idle_greetings") or {}
             if isinstance(idle, dict):
                 provider_migration_marker = "_idle_judge_provider_migrated"
-                migration_complete = bool(idle.get(provider_migration_marker, False))
+                migration_state = self._load_config_migration_state()
+                legacy_marker_present = bool(idle.pop(provider_migration_marker, False))
+                migration_complete = bool(
+                    migration_state.get(provider_migration_marker, False)
+                    or legacy_marker_present
+                )
+                if legacy_marker_present:
+                    migration_state[provider_migration_marker] = True
+                    changed = True
                 legacy_provider = proactive.get("proactive_judge_provider", "")
                 legacy_fallbacks = proactive.get(
                     "proactive_judge_fallback_providers", []
@@ -834,9 +845,9 @@ class Spark(Star):
                     # This marker is written even when no legacy chain exists. That
                     # distinguishes a new user's intentional empty configuration from
                     # an old configuration that still needs one-time migration.
-                    idle[provider_migration_marker] = True
-                    changed = True
+                    migration_state[provider_migration_marker] = True
                     logger.info("[Spark] completed idle judge provider migration")
+                self._save_config_migration_state(migration_state)
                 self.cfg["idle_greetings"] = idle
 
             enhancement = self.cfg.get("enhancement") or {}
@@ -901,6 +912,31 @@ class Spark(Star):
                 self.cfg.save_config()
         except Exception as e:
             logger.debug(f"[Spark] config migration: {e}")
+
+    def _load_config_migration_state(self) -> dict:
+        state = getattr(self, "_config_migration_state", None)
+        if isinstance(state, dict):
+            return dict(state)
+        path = getattr(self, "_config_migration_path", "")
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            return dict(loaded) if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return {}
+
+    def _save_config_migration_state(self, state: dict) -> None:
+        self._config_migration_state = dict(state)
+        path = getattr(self, "_config_migration_path", "")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=4)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(f"[Spark] 保存配置迁移状态失败: {exc}")
 
     async def initialize(self):
         """插件激活时的初始化方法（框架生命周期）"""

@@ -458,7 +458,8 @@ def test_config_migration_prefers_new_values_and_fills_legacy_fallbacks():
     assert idle["idle_random_fluctuation_minutes"] == 12
     assert idle["idle_judge_provider"] == "legacy-judge"
     assert idle["idle_judge_fallback_providers"] == ["legacy-fallback"]
-    assert idle["_idle_judge_provider_migrated"] is True
+    assert "_idle_judge_provider_migrated" not in idle
+    assert plugin._config_migration_state["_idle_judge_provider_migrated"] is True
     assert enhancement["mode"] == "固定时间"
     assert enhancement["fixed_delay_seconds"] == 200
     assert enhancement["fixed_random_fluctuation_seconds"] == 8
@@ -486,7 +487,8 @@ def test_config_migration_keeps_explicit_independent_values():
     idle = plugin.cfg["idle_greetings"]
     assert idle["idle_judge_provider"] == "new-judge"
     assert idle["idle_judge_fallback_providers"] == ["new-fallback"]
-    assert idle["_idle_judge_provider_migrated"] is True
+    assert "_idle_judge_provider_migrated" not in idle
+    assert plugin._config_migration_state["_idle_judge_provider_migrated"] is True
 
 
 def test_config_migration_fills_schema_materialized_empty_values_once():
@@ -509,7 +511,8 @@ def test_config_migration_fills_schema_materialized_empty_values_once():
     idle = plugin.cfg["idle_greetings"]
     assert idle["idle_judge_provider"] == "legacy-judge"
     assert idle["idle_judge_fallback_providers"] == ["legacy-fallback"]
-    assert idle["_idle_judge_provider_migrated"] is True
+    assert "_idle_judge_provider_migrated" not in idle
+    assert plugin._config_migration_state["_idle_judge_provider_migrated"] is True
 
 
 def test_config_migration_does_not_refill_user_cleared_values():
@@ -551,7 +554,8 @@ def test_new_user_marker_prevents_future_legacy_provider_copy():
     plugin.cfg = SaveableConfig({"idle_greetings": {}, "proactive_settings": {}})
 
     plugin._migrate_config()
-    assert plugin.cfg["idle_greetings"]["_idle_judge_provider_migrated"] is True
+    assert "_idle_judge_provider_migrated" not in plugin.cfg["idle_greetings"]
+    assert plugin._config_migration_state["_idle_judge_provider_migrated"] is True
 
     plugin.cfg["proactive_settings"] = {
         "proactive_judge_provider": "later-judge",
