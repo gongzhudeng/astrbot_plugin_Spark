@@ -1,4 +1,5 @@
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from data.plugins.astrbot_plugin_Spark.main import SessionState, Spark, UserProfile
+
+spark_module = sys.modules[Spark.__module__]
 
 UMO = "default:FriendMessage:idle-test"
 
@@ -187,6 +190,70 @@ async def test_positive_result_persists_one_candidate_without_repeat():
     assert plugin._judge_idle_delay_minutes.await_count == 1
     assert candidate > 0
     assert state.next_idle_ts == candidate
+    plugin._proactive_reply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_judge_result_is_total_idle_time_from_chat_anchor(monkeypatch):
+    plugin, state, _ = _plugin()
+    plugin._judge_idle_delay_minutes.return_value = 75
+    monkeypatch.setattr(spark_module, "_now_tz", lambda _tz: _at(4_600.0))
+
+    await plugin._check_idle_greeting(UMO, state, _at(4_600.0), "UTC", 0)
+
+    assert state.idle_judge_task_ts == 5_500.0
+    assert state.next_idle_ts == 5_500.0
+
+
+@pytest.mark.asyncio
+async def test_past_total_idle_target_becomes_due_now_without_using_zero(monkeypatch):
+    plugin, state, _ = _plugin()
+    plugin.cfg["idle_greetings"]["judge_min_delay_minutes"] = 1
+    plugin._judge_idle_delay_minutes.return_value = 15
+    monkeypatch.setattr(spark_module, "_now_tz", lambda _tz: _at(4_600.0))
+
+    await plugin._check_idle_greeting(UMO, state, _at(4_600.0), "UTC", 0)
+
+    assert state.idle_judge_task_ts == 4_600.0
+    assert state.next_idle_ts == 4_600.0
+
+
+@pytest.mark.asyncio
+async def test_busy_period_allows_judge_and_defers_candidate_five_minutes(monkeypatch):
+    plugin, state, _ = _plugin()
+    plugin._judge_idle_delay_minutes.return_value = 60
+    plugin.context._busy_schedule_get_timeline = lambda: [
+        {
+            "activity": "开会",
+            "start": _at(4_500.0),
+            "end": _at(5_000.0),
+            "valid": True,
+        }
+    ]
+    monkeypatch.setattr(spark_module, "_now_tz", lambda _tz: _at(4_600.0))
+
+    await plugin._check_idle_greeting(
+        UMO, state, _at(4_600.0), "UTC", 0, is_busy=True
+    )
+
+    plugin._judge_idle_delay_minutes.assert_awaited_once_with(UMO, "UTC")
+    assert state.idle_judge_task_ts == 5_300.0
+    plugin._proactive_reply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_due_candidate_is_not_sent_while_busy_without_timeline():
+    plugin, state, _ = _plugin()
+    state.idle_judge_checked_cycle = state.idle_judge_cycle
+    state.idle_judge_task_ts = 4_500.0
+    state.next_idle_ts = 4_500.0
+
+    await plugin._check_idle_greeting(
+        UMO, state, _at(4_600.0), "UTC", 0, is_busy=True
+    )
+
+    assert state.idle_judge_task_ts == 4_900.0
+    assert state.next_idle_ts == 4_900.0
     plugin._proactive_reply.assert_not_awaited()
 
 

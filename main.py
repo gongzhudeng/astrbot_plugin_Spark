@@ -7,10 +7,12 @@ import random
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.message.components import Image
 
 from .core.daily_projection import (
     project_activity_candidates,
@@ -61,6 +63,10 @@ from .core.provider_fallback import (
     normalize_provider_ids,
     resolve_provider_chain,
     select_generation_fallback_ids,
+)
+from .core.status_image_renderer import (
+    ProactiveStatusImageData,
+    ProactiveStatusImageRenderer,
 )
 from .core.time_policy import (
     apply_datetime_policy,
@@ -555,7 +561,7 @@ class DailyGreetingProjection:
     "astrbot_plugin_Spark",
     "灵犀 · 主动对话",
     "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候",
-    "2.6.3",
+    "2.7.0",
     "https://github.com/gongzhudeng/astrbot_plugin_Spark",
 )
 class Spark(Star):
@@ -580,6 +586,7 @@ class Spark(Star):
         self._enhancement_tasks: dict[str, asyncio.Task] = {}
         self._enhancement_gen: dict[str, int] = {}  # generation counter per umo
         self._heat_event_marker = "_spark_heat_counted"
+        self._status_image_renderer = ProactiveStatusImageRenderer(Path(__file__).parent)
 
         # 数据文件路径（使用规范的方式获取插件数据目录）
         if HAS_STARTOOLS:
@@ -1968,27 +1975,37 @@ class Spark(Star):
         now = _now_tz(tz)
 
         lines = ["--- 灵犀 · 主动对话 状态 ---"]
+        facts: list[tuple[str, str]] = []
+        daily_items: list[str] = []
+        subscription_label = "未订阅"
 
         if profile:
             sub_status = "已订阅" if profile.subscribed else "未订阅"
+            subscription_label = sub_status
             lines.append(f"订阅状态: {sub_status}")
             if profile.manual_unsubscribe:
                 lines.append("退订类型: 手动退订")
+                facts.append(("退订类型", "手动退订"))
             elif profile.auto_unsubscribed:
                 lines.append("退订类型: 自动退订（可自动恢复）")
+                facts.append(("退订类型", "自动退订（可自动恢复）"))
             if profile.quiet_hours:
                 lines.append(f"专属免打扰: {profile.quiet_hours}")
+                facts.append(("专属免打扰", profile.quiet_hours))
         else:
             lines.append("订阅状态: 未订阅")
 
         global_quiet = self._get_cfg("basic_settings", "quiet_hours", "") or ""
         if global_quiet:
             lines.append(f"全局免打扰: {global_quiet}")
+            facts.append(("全局免打扰", global_quiet))
 
         is_busy = getattr(self.context, "_busy_schedule_is_busy", False)
         lines.append(f"忙碌时段: {'是' if is_busy else '否'}")
 
         heat_enabled = bool(self._get_cfg("heat_settings", "enable_heat", True))
+        heat_label = "已关闭"
+        heat_val: float | None = None
         if heat_enabled:
             short_window_m, long_window_m, _full_score_messages, short_weight = (
                 self._get_heat_args()
@@ -2013,12 +2030,23 @@ class Spark(Star):
                 f"{recent_msg_count} 条消息；长期余温 {int(long_window_m)} 分钟，"
                 f"短期权重 {short_weight:.0%}"
             )
+            facts.append(
+                (
+                    "当前热度",
+                    f"{heat_label}({heat_val:.2f}) · 短期 {int(short_window_m)} 分钟 "
+                    f"{recent_msg_count} 条 · 长期 {int(long_window_m)} 分钟 · "
+                    f"权重 {short_weight:.0%}",
+                )
+            )
         else:
             lines.append("当前热度: 已关闭（使用固定沉寂延迟）")
+            facts.append(("当前热度", "已关闭 · 使用固定沉寂延迟"))
 
         if st and st.last_user_reply_ts > 0:
             delta = now.timestamp() - st.last_user_reply_ts
-            lines.append(f"距上次聊天: {_format_time_delta(delta)}")
+            last_chat = _format_time_delta(delta)
+            lines.append(f"距上次聊天: {last_chat}")
+            facts.append(("距上次聊天", last_chat))
 
         judge_enabled = self._get_cfg(
             "proactive_settings", "proactive_judge_enable", True
@@ -2108,14 +2136,17 @@ class Spark(Star):
             if task.source_type == "activity":
                 boundary_label = "开始" if task.boundary == "start" else "结束"
                 base_text = task.base.strftime("%m-%d %H:%M") if task.base else "未知"
-                lines.append(
-                    f"  {source}: {boundary_label} {base_text} -> "
-                    f"{task.target.strftime('%m-%d %H:%M')} | {status}"
+                daily_text = (
+                    f"{source}: {boundary_label} {base_text} → "
+                    f"{task.target.strftime('%m-%d %H:%M')} · {status}"
                 )
             else:
-                lines.append(
-                    f"  {source}: 固定时间 -> {task.target.strftime('%m-%d %H:%M')} | {status}"
+                daily_text = (
+                    f"{source}: 固定时间 → {task.target.strftime('%m-%d %H:%M')} · "
+                    f"{status}"
                 )
+            lines.append(f"  {daily_text}")
+            daily_items.append(daily_text)
 
             if status == "待触发":
                 diff_sec = max(0.0, (task.target - now).total_seconds())
@@ -2145,9 +2176,11 @@ class Spark(Star):
         for issue in visible_issues:
             label = issue_labels.get(issue.status, issue.status)
             activity = f"{issue.activity} | " if issue.activity else ""
-            lines.append(
-                f"  每日问候 {issue.slot_num + 1}: {activity}{label}（{issue.detail}）"
+            daily_text = (
+                f"每日问候 {issue.slot_num + 1}: {activity}{label}（{issue.detail}）"
             )
+            lines.append(f"  {daily_text}")
+            daily_items.append(daily_text)
 
         if pending:
             pending.sort(key=lambda x: x[0])
@@ -2156,7 +2189,28 @@ class Spark(Star):
         else:
             lines.append("待触发任务: 无")
 
-        yield event.plain_result("\n".join(lines))
+        try:
+            png = self._status_image_renderer.render(
+                ProactiveStatusImageData(
+                    subscription=subscription_label,
+                    subscribed=bool(profile and profile.subscribed),
+                    is_busy=is_busy,
+                    judge_enabled=bool(judge_enabled),
+                    heat_label=heat_label,
+                    heat_value=heat_val,
+                    facts=tuple(facts),
+                    daily_items=tuple(daily_items),
+                    pending_items=tuple(text.strip() for _, text in pending),
+                ),
+                now=now,
+                mode=self._get_cfg(
+                    "basic_settings", "status_image_theme", "自动切换"
+                ),
+            )
+            yield event.chain_result([Image.fromBytes(png)])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[Spark] Proactive status image rendering failed: %s", exc)
+            yield event.plain_result("\n".join(lines))
 
     # 主动帮助
     @filter.command("主动帮助")
@@ -2492,9 +2546,17 @@ class Spark(Star):
                 if st and await self._should_auto_unsubscribe(umo, profile, st, now):
                     continue
 
-                # Idle greetings: skip during DND/busy
-                if not is_in_dnd and not is_busy:
-                    await self._check_idle_greeting(umo, st, now, tz, reply_interval)
+                # DND stays fully silent. Busy periods may run the timing judge, but
+                # the idle state machine still blocks delivery until the period ends.
+                if not is_in_dnd:
+                    await self._check_idle_greeting(
+                        umo,
+                        st,
+                        now,
+                        tz,
+                        reply_interval,
+                        is_busy=is_busy,
+                    )
 
                 # Daily greetings: ignore_dnd items bypass DND/busy
                 await self._check_daily_greetings(
@@ -2527,6 +2589,55 @@ class Spark(Star):
         if not now.tzinfo and value.tzinfo:
             return value.replace(tzinfo=None)
         return value
+
+    def _busy_timeline(self, now: datetime) -> list[tuple[datetime, datetime, str]]:
+        get_timeline = getattr(self.context, "_busy_schedule_get_timeline", None)
+        if not callable(get_timeline):
+            return []
+        try:
+            raw_timeline = get_timeline()
+        except Exception as exc:
+            logger.debug(f"[Spark] 读取忙碌时间线失败: {exc}")
+            return []
+
+        periods: list[tuple[datetime, datetime, str]] = []
+        for item in raw_timeline or []:
+            if not isinstance(item, dict) or not item.get("valid", True):
+                continue
+            start = self._coerce_schedule_datetime(item.get("start"), now)
+            end = self._coerce_schedule_datetime(item.get("end"), now)
+            if not start or not end or end <= start:
+                continue
+            periods.append((start, end, str(item.get("activity") or "忙碌活动")))
+        return sorted(periods, key=lambda item: item[0])
+
+    def _format_busy_periods(self, now: datetime) -> str:
+        periods = self._busy_timeline(now)
+        if not periods:
+            return "无可用忙碌时间线"
+        return "\n".join(
+            f"- {start.strftime('%Y-%m-%d %H:%M')} ~ "
+            f"{end.strftime('%Y-%m-%d %H:%M')}：{activity}"
+            for start, end, activity in periods
+        )
+
+    def _defer_out_of_busy_periods(self, due_ts: float, now: datetime) -> float:
+        """Move a candidate to five minutes after any overlapping busy periods."""
+        target = datetime.fromtimestamp(due_ts, tz=now.tzinfo)
+        periods = self._busy_timeline(now)
+        for _ in range(len(periods) + 1):
+            overlap = next(
+                (
+                    (start, end)
+                    for start, end, _activity in periods
+                    if start <= target < end
+                ),
+                None,
+            )
+            if not overlap:
+                break
+            target = overlap[1] + timedelta(minutes=5)
+        return target.timestamp()
 
     def _daily_task(
         self,
@@ -2809,6 +2920,8 @@ class Spark(Star):
         now: datetime,
         tz: str | None,
         reply_interval: int,
+        *,
+        is_busy: bool = False,
     ):
         """Advance one durable idle-greeting cycle."""
         if not bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
@@ -2898,12 +3011,19 @@ class Spark(Star):
                 self._save_session_data()
                 return
 
-            decided_at = _now_tz(tz).timestamp()
-            st.idle_judge_task_ts = decided_at + delay_minutes * 60
+            decided_at_dt = _now_tz(tz)
+            decided_at = decided_at_dt.timestamp()
+            desired_due = anchor_ts + delay_minutes * 60
+            candidate_due = max(decided_at, desired_due)
+            candidate_due = self._defer_out_of_busy_periods(
+                candidate_due, decided_at_dt
+            )
+            st.idle_judge_task_ts = candidate_due
             st.next_idle_ts = st.idle_judge_task_ts
             logger.info(
                 f"[Spark] 沉寂延迟判断已创建一次性任务: {umo}, "
-                f"delay={delay_minutes}m, due={st.idle_judge_task_ts:.0f}"
+                f"total_idle={delay_minutes}m, desired={desired_due:.0f}, "
+                f"due={st.idle_judge_task_ts:.0f}"
             )
             self._save_session_data()
             return
@@ -2914,6 +3034,22 @@ class Spark(Star):
             self._save_session_data()
             return
         if now_ts < due_ts:
+            return
+
+        if is_busy:
+            deferred_due = self._defer_out_of_busy_periods(max(due_ts, now_ts), now)
+            if deferred_due <= now_ts:
+                # A temporary/manual busy state may not appear in the exported
+                # timeline. Rechecking every tick keeps delivery at least five
+                # minutes behind the last observed busy state.
+                deferred_due = now_ts + 5 * 60
+            if mode == "大模型判断":
+                st.idle_judge_task_ts = deferred_due
+            st.next_idle_ts = deferred_due
+            logger.info(
+                f"[Spark] 沉寂问候因忙碌顺延: {umo}, due={deferred_due:.0f}"
+            )
+            self._save_session_data()
             return
 
         cooldown_minutes = max(
@@ -3370,15 +3506,25 @@ class Spark(Star):
 
             st = self._states.get(umo)
             time_since_last_chat = "未知"
+            last_chat_at = "未知"
+            idle_elapsed_minutes = 0
             if st:
                 _last_chat_ts = max(
                     st.last_user_reply_ts,
                     st.last_proactive_reply_ts,
                     st.last_ai_reply_ts,
                 )
+                if delay_protocol and st.idle_judge_anchor_ts > 0:
+                    _last_chat_ts = st.idle_judge_anchor_ts
                 if _last_chat_ts > 0:
                     time_since_last_chat = _format_time_delta(
                         now.timestamp() - _last_chat_ts
+                    )
+                    last_chat_at = datetime.fromtimestamp(
+                        _last_chat_ts, tz=now.tzinfo
+                    ).strftime(time_fmt)
+                    idle_elapsed_minutes = max(
+                        0, int((now.timestamp() - _last_chat_ts) // 60)
                     )
 
             last_user, last_ai = await self._get_last_messages(umo)
@@ -3464,13 +3610,15 @@ class Spark(Star):
             judge_template = self._get_cfg(judge_group, judge_prompt_key) or ""
             if not judge_template:
                 judge_template = (
+                    "当前时间：{now}\n最后聊天时间：{last_chat_at}\n"
+                    "已沉寂：{idle_elapsed_minutes} 分钟（{time_since_last_chat}）\n"
                     "日程：{today_schedule}\n当前活动：{current_activity}\n"
+                    "下一个活动：{next_activity}\n忙碌状态：{busy_status}\n"
+                    "忙碌时间线：\n{busy_periods}\n"
                     "用户节律：{time_period_prompt}\n内心世界：\n{emotion_state}\n"
-                    "距上次聊天：{time_since_last_chat}\n"
                     "最近用户消息：{last_user}\n最近AI回复：{last_ai}\n\n"
-                    "判断下一次主动联系的等待分钟数。明确承诺或日程后续通常 5~90 分钟；"
-                    "未完成话题通常 15~60 分钟；普通沉寂通常 120~180 分钟；"
-                    "没有合适联系理由或当前不宜打扰时返回 0。"
+                    "先根据聊天记录、日程和忙碌时间线确定理想的绝对联系时刻，"
+                    "再输出从最后聊天时间起算的总沉寂分钟数。"
                     if delay_protocol
                     else (
                         "日程：{today_schedule}\n当前活动：{current_activity}\n"
@@ -3496,6 +3644,10 @@ class Spark(Star):
                 self.context, "_busy_schedule_current_activity", ""
             )
             next_activity = getattr(self.context, "_busy_schedule_next_activity", "")
+            busy_status = "忙碌中" if getattr(
+                self.context, "_busy_schedule_is_busy", False
+            ) else "当前不忙碌"
+            busy_periods = self._format_busy_periods(now)
             custom_prompt = getattr(self.context, "_busy_schedule_custom_prompt", "")
             _get_prompt = getattr(self.context, "_time_period_get_prompt", None)
             time_period_prompt = (
@@ -3517,24 +3669,30 @@ class Spark(Star):
             else:
                 heat_level = "冷"
 
-            judge_prompt = _format_template(
-                judge_template,
-                {
-                    "now": now_str,
-                    "last_user": last_user,
-                    "last_ai": last_ai,
-                    "time_since_last_chat": time_since_last_chat,
-                    "umo": umo,
-                    "today_schedule": today_schedule,
-                    "outfit": outfit,
-                    "current_activity": current_activity,
-                    "next_activity": next_activity,
-                    "custom_prompt": custom_prompt,
-                    "time_period_prompt": time_period_prompt,
-                    "emotion_state": emotion_state,
-                    "heat_level": heat_level,
-                },
-            )
+            prompt_values = {
+                "now": now_str,
+                "last_chat_at": last_chat_at,
+                "idle_elapsed_minutes": idle_elapsed_minutes,
+                "judge_after_minutes": self._idle_judge_after_minutes(),
+                "idle_min_total_minutes": self._idle_judge_bounds()[0],
+                "idle_max_total_minutes": self._idle_judge_bounds()[1],
+                "last_user": last_user,
+                "last_ai": last_ai,
+                "time_since_last_chat": time_since_last_chat,
+                "umo": umo,
+                "today_schedule": today_schedule,
+                "outfit": outfit,
+                "current_activity": current_activity,
+                "next_activity": next_activity,
+                "busy_status": busy_status,
+                "busy_periods": busy_periods,
+                "custom_prompt": custom_prompt,
+                "time_period_prompt": time_period_prompt,
+                "emotion_state": emotion_state,
+                "heat_level": heat_level,
+            }
+            judge_prompt = _format_template(judge_template, prompt_values)
+            judge_rules = _format_template(judge_rules, prompt_values)
 
             providers = self._get_judge_providers(
                 umo,

@@ -6,10 +6,7 @@ import pytest
 from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.provider.entities import ProviderRequest
-from data.plugins.astrbot_plugin_busy_schedule.main import (
-    _position_emotion_anchor,
-    _replace_prompt_block,
-)
+from data.plugins.astrbot_plugin_busy_schedule.main import _rebuild_system_prompt
 from data.plugins.astrbot_plugin_emotion_state.core.injector import (
     ANCHOR,
     BLOCK_END,
@@ -45,18 +42,12 @@ CUSTOM_END = "<!-- /BUSY_SCHEDULE_CUSTOM -->"
 
 
 def build_prompt_with_emotion() -> str:
-    prompt = _replace_prompt_block(
+    prompt = _rebuild_system_prompt(
         "persona",
-        CACHE_START,
-        CACHE_END,
-        "<character_static>daily facts</character_static>",
-    )
-    prompt = _position_emotion_anchor(prompt, CACHE_END)
-    prompt = _replace_prompt_block(
-        prompt,
-        CUSTOM_START,
-        CUSTOM_END,
-        "<character_custom>dynamic facts</character_custom>",
+        {
+            "daily": "<character_static>daily facts</character_static>",
+            "custom": "<character_custom>dynamic facts</character_custom>",
+        },
     )
     return inject_prompt(prompt, StateLedger(user_key="default:FriendMessage:42"))
 
@@ -117,10 +108,11 @@ def test_cron_event_keeps_original_session_and_emotion_prompt_order():
     positions = [
         req.system_prompt.index(CACHE_START),
         req.system_prompt.index(CACHE_END),
+        req.system_prompt.index(CUSTOM_START),
+        req.system_prompt.index(CUSTOM_END),
         req.system_prompt.index(ANCHOR),
         req.system_prompt.index(BLOCK_START),
         req.system_prompt.index(BLOCK_END),
-        req.system_prompt.index(CUSTOM_START),
     ]
 
     assert event.unified_msg_origin == "default:FriendMessage:42"
