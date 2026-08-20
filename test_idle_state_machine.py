@@ -241,6 +241,46 @@ async def test_busy_period_allows_judge_and_defers_candidate_five_minutes(monkey
     plugin._proactive_reply.assert_not_awaited()
 
 
+def test_open_activity_is_not_treated_as_busy():
+    plugin, _, _ = _plugin()
+    plugin.context._busy_schedule_get_timeline = lambda: [
+        {
+            "activity": "看电影",
+            "period_type": "activity",
+            "start": _at(4_500.0),
+            "end": _at(5_000.0),
+            "is_busy": False,
+            "valid": True,
+        }
+    ]
+
+    assert plugin._defer_out_of_busy_periods(4_600.0, _at(4_600.0)) == 4_600.0
+
+
+def test_open_activity_before_sleep_only_defers_to_sleep_end():
+    plugin, _, _ = _plugin()
+    plugin.context._busy_schedule_get_timeline = lambda: [
+        {
+            "activity": "看电影",
+            "period_type": "activity",
+            "start": _at(4_500.0),
+            "end": _at(5_000.0),
+            "is_busy": False,
+            "valid": True,
+        },
+        {
+            "activity": "睡觉",
+            "period_type": "sleep",
+            "start": _at(5_000.0),
+            "end": _at(6_000.0),
+            "is_busy": True,
+            "valid": True,
+        },
+    ]
+
+    assert plugin._defer_out_of_busy_periods(5_500.0, _at(5_500.0)) == 6_300.0
+
+
 @pytest.mark.asyncio
 async def test_due_candidate_is_not_sent_while_busy_without_timeline():
     plugin, state, _ = _plugin()

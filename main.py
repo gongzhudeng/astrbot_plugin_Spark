@@ -2644,6 +2644,12 @@ class Spark(Star):
             end = self._coerce_schedule_datetime(item.get("end"), now)
             if not start or not end or end <= start:
                 continue
+            # New busy_schedule versions expose the explicit marker. Legacy
+            # timelines lack enough information to distinguish activity types,
+            # so keep their previous all-busy behavior for compatibility.
+            is_busy = bool(item.get("is_busy", True))
+            if not is_busy:
+                continue
             periods.append((start, end, str(item.get("activity") or "忙碌活动")))
         return sorted(periods, key=lambda item: item[0])
 
