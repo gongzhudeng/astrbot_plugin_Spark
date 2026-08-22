@@ -5,6 +5,7 @@ import json
 import os
 import random
 import re
+import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -561,7 +562,7 @@ class DailyGreetingProjection:
     "astrbot_plugin_Spark",
     "灵犀 · 主动对话",
     "让 AI 像真人一样主动找你聊天——通过大模型智能判断何时该开口、何时该沉默，支持忙碌时段免打扰、独立判断/生成双模型、无限定时问候",
-    "2.7.1",
+    "2.7.3",
     "https://github.com/gongzhudeng/astrbot_plugin_Spark",
 )
 class Spark(Star):
@@ -1041,6 +1042,30 @@ class Spark(Star):
             return int(value)
         except (TypeError, ValueError):
             return int(default)
+
+    def _get_model_call_limits(
+        self,
+        group_key: str,
+        retries_key: str,
+        timeout_key: str,
+        *,
+        default_retries: int,
+        default_timeout: float,
+    ) -> tuple[int, float]:
+        """Return plugin-level retry and wall-clock limits for one model use."""
+        retries = max(
+            0,
+            min(
+                10,
+                self._get_int_cfg(group_key, retries_key, default_retries),
+            ),
+        )
+        raw_timeout = self._get_cfg(group_key, timeout_key, default_timeout)
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            timeout = float(default_timeout)
+        return retries, max(1.0, min(3600.0, timeout))
 
     def _get_heat_args(self) -> tuple[float, float, float, float]:
         heat_cfg = self.cfg.get("heat_settings") or {}
@@ -3757,7 +3782,23 @@ class Spark(Star):
                     else "你是一个对话判断助手，只回复是或否"
                 )
 
-            judge_retries = 3
+            if delay_protocol:
+                judge_retries, judge_timeout = self._get_model_call_limits(
+                    "idle_greetings",
+                    "idle_judge_model_max_retries",
+                    "idle_judge_model_timeout_seconds",
+                    default_retries=0,
+                    default_timeout=30.0,
+                )
+            else:
+                judge_retries, judge_timeout = self._get_model_call_limits(
+                    "proactive_settings",
+                    "proactive_judge_model_max_retries",
+                    "proactive_judge_model_timeout_seconds",
+                    default_retries=0,
+                    default_timeout=30.0,
+                )
+            judge_max_attempts = judge_retries + 1
             last_err = None
             for provider_index, provider in enumerate(providers):
                 provider_id = self._provider_id(provider) or "<unknown>"
@@ -3765,16 +3806,21 @@ class Spark(Star):
                     logger.warning(
                         f"[Spark] 判断模型切换到回退供应商: {provider_id} ({umo})"
                     )
-                for attempt in range(judge_retries):
+                for attempt in range(judge_max_attempts):
                     try:
-                        llm_resp = await provider.text_chat(
-                            prompt=None,
-                            contexts=judge_contexts
-                            + [
-                                {"role": "user", "content": judge_prompt},
-                                {"role": "user", "content": judge_rules},
-                            ],
-                            system_prompt=judge_persona,
+                        started = time_module.perf_counter()
+                        llm_resp = await asyncio.wait_for(
+                            provider.text_chat(
+                                prompt=None,
+                                contexts=judge_contexts
+                                + [
+                                    {"role": "user", "content": judge_prompt},
+                                    {"role": "user", "content": judge_rules},
+                                ],
+                                system_prompt=judge_persona,
+                                request_max_retries=1,
+                            ),
+                            timeout=judge_timeout,
                         )
                         response = (
                             llm_resp.completion_text
@@ -3795,7 +3841,9 @@ class Spark(Star):
                                 )
                             logger.info(
                                 f"[Spark] Judge delay for {umo} via {provider_id}: "
-                                f"{delay_minutes} minutes"
+                                f"{delay_minutes} minutes "
+                                f"(attempt {attempt + 1}/{judge_max_attempts}, "
+                                f"elapsed={time_module.perf_counter() - started:.1f}s)"
                             )
                             return delay_minutes
 
@@ -3803,14 +3851,16 @@ class Spark(Star):
                         result = "YES" if should_reply else "NO"
                         logger.info(
                             f"[Spark] Judge {result} for {umo} via {provider_id}: "
-                            f"'{response[:20]}'"
+                            f"'{response[:20]}' "
+                            f"(attempt {attempt + 1}/{judge_max_attempts}, "
+                            f"elapsed={time_module.perf_counter() - started:.1f}s)"
                         )
                         return should_reply
 
                     except Exception as e:
                         last_err = e
                         err_str = str(e).lower()
-                        is_retryable = (
+                        is_retryable = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or (
                             any(code in err_str for code in ("502", "503", "504"))
                             or "no usable output" in err_str
                             or "empty" in err_str
@@ -3818,11 +3868,12 @@ class Spark(Star):
                             or "timeout" in err_str
                             or "connect" in err_str
                         )
-                        if is_retryable and attempt < judge_retries - 1:
+                        if is_retryable and attempt < judge_max_attempts - 1:
                             wait = 2 ** (attempt + 1)
                             logger.warning(
-                                f"[Spark] Judge retry {attempt + 1}/{judge_retries} "
-                                f"via {provider_id} for {umo}: {e}, waiting {wait}s"
+                                f"[Spark] Judge retry {attempt + 1}/{judge_max_attempts - 1} "
+                                f"via {provider_id} for {umo}: {e}, waiting {wait}s "
+                                f"(timeout={judge_timeout:.1f}s)"
                             )
                             await asyncio.sleep(wait)
                             continue
@@ -4359,14 +4410,48 @@ class Spark(Star):
             gen_persona = await self._get_gen_persona(umo)
 
             if HAS_AGENT_PIPELINE:
-                delivery = await self._run_agent_pipeline(
-                    umo,
-                    prompt,
-                    tz,
-                    provider=gen_provider,
-                    persona=gen_persona,
-                    slash_triggered=slash_triggered,
+                generation_retries, generation_timeout = self._get_model_call_limits(
+                    "proactive_settings",
+                    "proactive_generation_model_max_retries",
+                    "proactive_generation_model_timeout_seconds",
+                    default_retries=0,
+                    default_timeout=120.0,
                 )
+                generation_max_attempts = generation_retries + 1
+                delivery = None
+                generation_error = None
+                for attempt in range(generation_max_attempts):
+                    started = time_module.perf_counter()
+                    try:
+                        delivery = await asyncio.wait_for(
+                            self._run_agent_pipeline(
+                                umo,
+                                prompt,
+                                tz,
+                                provider=gen_provider,
+                                persona=gen_persona,
+                                slash_triggered=slash_triggered,
+                            ),
+                            timeout=generation_timeout,
+                        )
+                        if delivery is not None:
+                            logger.info(
+                                f"[Spark] Agent 生成完成: {umo}, "
+                                f"attempt={attempt + 1}/{generation_max_attempts}, "
+                                f"elapsed={time_module.perf_counter() - started:.1f}s"
+                            )
+                            break
+                        generation_error = RuntimeError("Agent pipeline returned no delivery")
+                    except Exception as exc:
+                        generation_error = exc
+                    if attempt < generation_max_attempts - 1:
+                        logger.warning(
+                            f"[Spark] Agent 生成失败，准备重试({umo}) "
+                            f"attempt={attempt + 1}/{generation_max_attempts}, "
+                            f"timeout={generation_timeout:.1f}s: {generation_error}"
+                        )
+                if delivery is None and generation_error is not None:
+                    logger.error(f"[Spark] Agent 生成模型均失败({umo}): {generation_error}")
             else:
                 logger.error(
                     f"[Spark] Agent Pipeline 不可用，主动对话退回旧路径；"
@@ -4702,6 +4787,9 @@ class Spark(Star):
             return None
         provider = generation_providers[0]
         config.provider_settings = dict(config.provider_settings)
+        # The plugin-level generation loop owns retry semantics for proactive
+        # replies; keep each Agent provider request to one transport attempt.
+        config.provider_settings["request_max_retries"] = 1
         config.provider_settings["fallback_chat_models"] = [
             provider_id
             for candidate in generation_providers[1:]
@@ -4920,6 +5008,14 @@ class Spark(Star):
             ):
                 return None
 
+        generation_retries, generation_timeout = self._get_model_call_limits(
+            "proactive_settings",
+            "proactive_generation_model_max_retries",
+            "proactive_generation_model_timeout_seconds",
+            default_retries=0,
+            default_timeout=120.0,
+        )
+        generation_max_attempts = generation_retries + 1
         last_err = None
         for provider_index, candidate in enumerate(providers):
             provider_id = self._provider_id(candidate) or "<unknown>"
@@ -4927,31 +5023,44 @@ class Spark(Star):
                 logger.warning(
                     f"[Spark] 旧生成路径切换到回退供应商: {provider_id} ({umo})"
                 )
-            try:
-                llm_resp = await candidate.text_chat(
-                    prompt=req.prompt if req else None,
-                    contexts=req.contexts
-                    if req
-                    else [{"role": "user", "content": prompt}] + contexts,
-                    system_prompt=req.system_prompt if req else persona,
-                    extra_user_content_parts=(
-                        req.extra_user_content_parts if req else None
-                    ),
-                )
-                text = (
-                    llm_resp.completion_text
-                    if hasattr(llm_resp, "completion_text")
-                    else ""
-                )
-                text = self._clean_output_text(text)
-                if text:
-                    return text
-                raise ValueError("Empty completion text")
-            except Exception as exc:
-                last_err = exc
-                logger.warning(
-                    f"[Spark] 旧生成路径模型 {provider_id} 调用失败({umo}): {exc}"
-                )
+            for attempt in range(generation_max_attempts):
+                started = time_module.perf_counter()
+                try:
+                    llm_resp = await asyncio.wait_for(
+                        candidate.text_chat(
+                            prompt=req.prompt if req else None,
+                            contexts=req.contexts
+                            if req
+                            else [{"role": "user", "content": prompt}] + contexts,
+                            system_prompt=req.system_prompt if req else persona,
+                            extra_user_content_parts=(
+                                req.extra_user_content_parts if req else None
+                            ),
+                            request_max_retries=1,
+                        ),
+                        timeout=generation_timeout,
+                    )
+                    text = (
+                        llm_resp.completion_text
+                        if hasattr(llm_resp, "completion_text")
+                        else ""
+                    )
+                    text = self._clean_output_text(text)
+                    if text:
+                        logger.info(
+                            f"[Spark] 旧生成路径模型成功: {provider_id} "
+                            f"attempt={attempt + 1}/{generation_max_attempts}, "
+                            f"elapsed={time_module.perf_counter() - started:.1f}s"
+                        )
+                        return text
+                    raise ValueError("Empty completion text")
+                except Exception as exc:
+                    last_err = exc
+                    logger.warning(
+                        f"[Spark] 旧生成路径模型 {provider_id} 调用失败({umo}) "
+                        f"attempt={attempt + 1}/{generation_max_attempts}, "
+                        f"timeout={generation_timeout:.1f}s: {exc}"
+                    )
 
         logger.error(f"[Spark] 所有生成模型均失败({umo}): {last_err}")
         return None

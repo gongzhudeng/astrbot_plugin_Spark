@@ -222,11 +222,27 @@
         "default": 1440
       },
       "judge_retry_minutes": {
-        "description": "判断技术失败重试（分钟）",
-        "hint": "仅模型不可用、空响应、非整数或越界时使用；模型返回 0 不重试。",
+        "description": "沉寂技术失败后再次检查间隔（分钟）",
+        "hint": "这是一次沉寂判断或沉寂问候投递失败后，下一轮再次检查的间隔，不是单次模型调用的重试次数；单次重试请看判断模型重试设置。",
         "type": "int",
         "condition": {"mode": "大模型判断"},
         "default": 5
+      },
+      "idle_judge_model_max_retries": {
+        "description": "沉寂判断每个模型最大重试次数",
+        "hint": "只计算首次请求之后的追加重试次数；0 表示当前模型失败后立即切换下一个判断模型。",
+        "type": "int",
+        "condition": {"mode": "大模型判断"},
+        "slider": { "min": 0, "max": 10, "step": 1 },
+        "default": 0
+      },
+      "idle_judge_model_timeout_seconds": {
+        "description": "沉寂判断单次模型最大等待时间（秒）",
+        "hint": "每次沉寂判断模型调用的插件层硬超时；超时或协议错误会按重试次数处理。",
+        "type": "int",
+        "condition": {"mode": "大模型判断"},
+        "slider": { "min": 5, "max": 600, "step": 5 },
+        "default": 30
       },
       "idle_judge_prompt": {
         "description": "判断多长时间参考信息",
@@ -324,6 +340,20 @@
         "default": [],
         "_special": "select_providers"
       },
+      "proactive_judge_model_max_retries": {
+        "description": "主动判断每个模型最大重试次数",
+        "hint": "只计算首次请求之后的追加重试次数；0 表示当前模型失败后立即切换下一个判断模型。",
+        "type": "int",
+        "slider": { "min": 0, "max": 10, "step": 1 },
+        "default": 0
+      },
+      "proactive_judge_model_timeout_seconds": {
+        "description": "主动判断单次模型最大等待时间（秒）",
+        "hint": "每次判断模型调用的插件层硬超时；超时或协议错误会按重试次数处理。",
+        "type": "int",
+        "slider": { "min": 5, "max": 600, "step": 5 },
+        "default": 30
+      },
       "judge_persona_id": {
         "description": "判断模型人格",
         "hint": "留空则使用当前对话的人格",
@@ -370,6 +400,20 @@
         "items": { "type": "string" },
         "default": [],
         "_special": "select_providers"
+      },
+      "proactive_generation_model_max_retries": {
+        "description": "主动生成每个模型最大重试次数",
+        "hint": "只计算首次生成请求之后的追加重试次数；0 表示当前模型失败后立即切换回退模型。Agent 路径按整次生成流程重试。",
+        "type": "int",
+        "slider": { "min": 0, "max": 5, "step": 1 },
+        "default": 0
+      },
+      "proactive_generation_model_timeout_seconds": {
+        "description": "主动生成单次最大等待时间（秒）",
+        "hint": "主动回复生成的插件层硬超时；Agent 路径限制整次生成流程，旧版直连路径限制单次模型调用。",
+        "type": "int",
+        "slider": { "min": 10, "max": 3600, "step": 10 },
+        "default": 120
       },
       "gen_persona_id": {
         "description": "生成模型人格",
@@ -525,13 +569,13 @@
       },
       "technical_retry_max_attempts": {
         "description": "技术失败最大尝试次数",
-        "hint": "仅模型、网络或平台发送失败会重试；免打扰、忙碌和聊天冷却属于正常跳过，不重试。",
+        "hint": "这是每日问候投递任务的总尝试次数（包含首次尝试），不是单次模型调用重试次数；仅模型、网络或平台发送失败会重试。",
         "type": "int",
         "default": 3
       },
       "technical_retry_interval_seconds": {
         "description": "技术失败重试基础间隔（秒）",
-        "hint": "后续失败使用有限指数退避，且不会超过重试窗口。",
+        "hint": "每日问候投递失败后的有限指数退避基础间隔，且不会超过重试窗口。",
         "type": "int",
         "default": 60
       },
