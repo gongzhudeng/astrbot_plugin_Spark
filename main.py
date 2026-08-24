@@ -587,7 +587,9 @@ class Spark(Star):
         self._enhancement_tasks: dict[str, asyncio.Task] = {}
         self._enhancement_gen: dict[str, int] = {}  # generation counter per umo
         self._heat_event_marker = "_spark_heat_counted"
-        self._status_image_renderer = ProactiveStatusImageRenderer(Path(__file__).parent)
+        self._status_image_renderer = ProactiveStatusImageRenderer(
+            Path(__file__).parent
+        )
 
         # 数据文件路径（使用规范的方式获取插件数据目录）
         if HAS_STARTOOLS:
@@ -2264,9 +2266,7 @@ class Spark(Star):
                     pending_items=tuple(text.strip() for _, text in pending),
                 ),
                 now=now,
-                mode=self._get_cfg(
-                    "basic_settings", "status_image_theme", "自动切换"
-                ),
+                mode=self._get_cfg("basic_settings", "status_image_theme", "自动切换"),
             )
             yield event.chain_result([Image.fromBytes(png)])
         except Exception as exc:  # noqa: BLE001
@@ -3113,9 +3113,7 @@ class Spark(Star):
             if mode == "大模型判断":
                 st.idle_judge_task_ts = deferred_due
             st.next_idle_ts = deferred_due
-            logger.info(
-                f"[Spark] 沉寂问候因忙碌顺延: {umo}, due={deferred_due:.0f}"
-            )
+            logger.info(f"[Spark] 沉寂问候因忙碌顺延: {umo}, due={deferred_due:.0f}")
             self._save_session_data()
             return
 
@@ -3353,13 +3351,19 @@ class Spark(Star):
                         logger.warning(f"[Spark] wake_and_flush 失败: {exc}")
                 await asyncio.sleep(flush_delay)
 
+            # Anchor the attempt to the scheduler tick, then advance it by the
+            # real elapsed send duration. Using wall-clock directly would break
+            # tests that inject `now`, while the raw tick alone predates a long
+            # LLM call and makes next_retry_at land in the past.
+            attempt_started_at = now_ts
             sending = begin_attempt(
                 planned,
-                now_ts=now_ts,
+                now_ts=attempt_started_at,
                 retry_window_seconds=retry_window_seconds,
             )
             st.set_daily_state(sending)
             self._save_session_data()
+            send_started_monotonic = time_module.monotonic()
             ok = await self._proactive_reply(
                 umo,
                 tz,
@@ -3367,13 +3371,15 @@ class Spark(Star):
                 skip_judge=True,
                 source="daily_greeting",
             )
-            delivery_completed_at = _now_tz(tz).timestamp()
+            delivery_completed_at = (
+                attempt_started_at + time_module.monotonic() - send_started_monotonic
+            )
             if ok:
                 st.set_daily_state(
                     terminal_state(
                         sending,
                         "sent",
-                        now_ts=now_ts,
+                        now_ts=delivery_completed_at,
                         reason="delivered",
                     )
                 )
@@ -3392,7 +3398,7 @@ class Spark(Star):
             st.set_daily_state(
                 technical_failure(
                     sending,
-                    now_ts=now_ts,
+                    now_ts=delivery_completed_at,
                     max_attempts=max_attempts,
                     retry_interval_seconds=retry_interval_seconds,
                 )
@@ -3711,9 +3717,11 @@ class Spark(Star):
                 self.context, "_busy_schedule_current_activity", ""
             )
             next_activity = getattr(self.context, "_busy_schedule_next_activity", "")
-            busy_status = "忙碌中" if getattr(
-                self.context, "_busy_schedule_is_busy", False
-            ) else "当前不忙碌"
+            busy_status = (
+                "忙碌中"
+                if getattr(self.context, "_busy_schedule_is_busy", False)
+                else "当前不忙碌"
+            )
             busy_periods = self._format_busy_periods(now)
             custom_prompt = getattr(self.context, "_busy_schedule_custom_prompt", "")
             _get_prompt = getattr(self.context, "_time_period_get_prompt", None)
@@ -3860,7 +3868,9 @@ class Spark(Star):
                     except Exception as e:
                         last_err = e
                         err_str = str(e).lower()
-                        is_retryable = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or (
+                        is_retryable = isinstance(
+                            e, (asyncio.TimeoutError, TimeoutError)
+                        ) or (
                             any(code in err_str for code in ("502", "503", "504"))
                             or "no usable output" in err_str
                             or "empty" in err_str
@@ -4418,6 +4428,9 @@ class Spark(Star):
                     default_timeout=120.0,
                 )
                 generation_max_attempts = generation_retries + 1
+                # Shared with the pipeline so texts streamed to the user before a
+                # timeout stay observable and are never re-sent by a retry.
+                partial_delivered: list[str] = []
                 delivery = None
                 generation_error = None
                 for attempt in range(generation_max_attempts):
@@ -4431,6 +4444,7 @@ class Spark(Star):
                                 provider=gen_provider,
                                 persona=gen_persona,
                                 slash_triggered=slash_triggered,
+                                delivered_out=partial_delivered,
                             ),
                             timeout=generation_timeout,
                         )
@@ -4441,9 +4455,27 @@ class Spark(Star):
                                 f"elapsed={time_module.perf_counter() - started:.1f}s"
                             )
                             break
-                        generation_error = RuntimeError("Agent pipeline returned no delivery")
+                        generation_error = RuntimeError(
+                            "Agent pipeline returned no delivery"
+                        )
                     except Exception as exc:
                         generation_error = exc
+                        # wait_for cancels the whole pipeline on timeout, but visible
+                        # texts may already be delivered. Treat that as success so the
+                        # caller does not mark a technical failure and duplicate the
+                        # greeting.
+                        if isinstance(exc, asyncio.TimeoutError) and partial_delivered:
+                            logger.warning(
+                                f"[Spark] Agent 生成超时但已送达 {len(partial_delivered)} 段文本，"
+                                f"按成功处理以避免重发: {umo}"
+                            )
+                            delivery = AgentDeliveryResult(
+                                response_text="",
+                                history_text="\n".join(partial_delivered),
+                                already_delivered=True,
+                                delivery_kind="text",
+                            )
+                            break
                     if attempt < generation_max_attempts - 1:
                         logger.warning(
                             f"[Spark] Agent 生成失败，准备重试({umo}) "
@@ -4451,7 +4483,9 @@ class Spark(Star):
                             f"timeout={generation_timeout:.1f}s: {generation_error}"
                         )
                 if delivery is None and generation_error is not None:
-                    logger.error(f"[Spark] Agent 生成模型均失败({umo}): {generation_error}")
+                    logger.error(
+                        f"[Spark] Agent 生成模型均失败({umo}): {generation_error}"
+                    )
             else:
                 logger.error(
                     f"[Spark] Agent Pipeline 不可用，主动对话退回旧路径；"
@@ -4759,6 +4793,7 @@ class Spark(Star):
         provider=None,
         persona: str = "",
         slash_triggered: bool = False,
+        delivered_out: list[str] | None = None,
     ) -> AgentDeliveryResult | None:
         """通过官方 CronMessageEvent + build_main_agent 执行 Agent Pipeline"""
         self._last_cron_event_sent = False
@@ -4890,7 +4925,9 @@ class Spark(Star):
         if result.reset_coro:
             await result.reset_coro
 
-        delivered_texts = await self._consume_agent_responses(umo, runner)
+        delivered_texts = await self._consume_agent_responses(
+            umo, runner, delivered_out=delivered_out
+        )
 
         llm_resp = runner.get_final_llm_resp()
         delivery = resolve_agent_delivery(
@@ -4933,10 +4970,14 @@ class Spark(Star):
 
         return delivery
 
-    async def _consume_agent_responses(self, umo: str, runner) -> list[str]:
+    async def _consume_agent_responses(
+        self, umo: str, runner, delivered_out: list[str] | None = None
+    ) -> list[str]:
         delivered_texts: list[str] = []
         async for agent_response in runner.step_until_done(30):
-            await self._send_visible_agent_text(umo, agent_response, delivered_texts)
+            await self._send_visible_agent_text(
+                umo, agent_response, delivered_texts, delivered_out
+            )
         return delivered_texts
 
     async def _send_visible_agent_text(
@@ -4944,6 +4985,7 @@ class Spark(Star):
         umo: str,
         agent_response,
         delivered_texts: list[str],
+        delivered_out: list[str] | None = None,
     ) -> None:
         if getattr(agent_response, "type", "") != "llm_result":
             return
@@ -4959,6 +5001,8 @@ class Spark(Star):
 
         if await self._send_text(umo, text):
             delivered_texts.append(text)
+            if delivered_out is not None:
+                delivered_out.append(text)
             logger.info(f"[Spark] 已提前发送 Agent 文本给 {umo}: {text[:50]}...")
 
     async def _run_legacy_llm(
