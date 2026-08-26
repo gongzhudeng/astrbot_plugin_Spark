@@ -2122,12 +2122,25 @@ class Spark(Star):
         pending: list[tuple[float, str]] = []
         if st and st.next_idle_ts > 0:
             remaining = st.next_idle_ts - now.timestamp()
+            idle_mode = self._idle_mode()
+            # In LLM-judge mode next_idle_ts means different things per stage:
+            # before judging it points at the judge call, after a one-shot task
+            # exists it points at the actual greeting delivery.
+            if idle_mode == "大模型判断":
+                if st.idle_retry_after_ts > now.timestamp():
+                    idle_label = "大模型判断重试"
+                elif st.idle_judge_task_ts > 0:
+                    idle_label = "沉寂问候"
+                else:
+                    idle_label = "大模型判断"
+            else:
+                idle_label = "沉寂问候"
             if remaining > 0:
                 pending.append(
-                    (remaining, f"  沉寂问候 → 约 {int(remaining / 60)} 分钟后")
+                    (remaining, f"  {idle_label} → 约 {int(remaining / 60)} 分钟后")
                 )
             else:
-                pending.append((0.0, "  沉寂问候 → 等待触发条件"))
+                pending.append((0.0, f"  {idle_label} → 等待触发条件"))
 
         if st and st.next_enhancement_ts > 0:
             remaining_enh = st.next_enhancement_ts - now.timestamp()
