@@ -1,14 +1,13 @@
-"""Local Pillow renderer for the proactive status command."""
+"""Glassmorphism Pillow renderer for the proactive status command (S2b)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from .style_kit import Canvas, c, font
 
 
 @dataclass(frozen=True)
@@ -24,6 +23,37 @@ class ProactiveStatusImageData:
     facts: tuple[tuple[str, str], ...]
     daily_items: tuple[str, ...]
     pending_items: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "facts",
+            tuple((str(k), str(v)) for k, v in self.facts),
+        )
+        object.__setattr__(self, "daily_items", tuple(str(i) for i in self.daily_items))
+        object.__setattr__(
+            self, "pending_items", tuple(str(i) for i in self.pending_items)
+        )
+
+
+def _split_status(item: str) -> tuple[str, str | None]:
+    """Split a trailing `` · status`` tag off a daily item when present."""
+    if " · " in item:
+        main, status = item.rsplit(" · ", 1)
+        return main, status
+    return item, None
+
+
+def _status_kind(status: str | None) -> str:
+    if status is None:
+        return "none"
+    if "已发送" in status:
+        return "sent"
+    if "跳过" in status:
+        return "skipped"
+    if "待触发" in status:
+        return "waiting"
+    return "other"
 
 
 class ProactiveStatusImageRenderer:
@@ -73,359 +103,304 @@ class ProactiveStatusImageRenderer:
             Encoded RGB PNG bytes.
         """
         theme = self.resolve_theme(mode, now)
-        image = self._render_image(data, now, theme)
-        output = BytesIO()
-        image.save(output, format="PNG", optimize=True)
-        return output.getvalue()
+        return self._render_image(data, now, theme)
 
-    def _font(self, size: int, bold: bool = False):
-        candidates = []
-        if bold:
-            candidates.extend(
-                [
-                    Path(r"C:\Windows\Fonts\Dengb.ttf"),
-                    Path(r"C:\Windows\Fonts\msyhbd.ttc"),
-                    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
-                    Path("/System/Library/Fonts/PingFang.ttc"),
-                ]
-            )
-        candidates.extend(
-            [
-                Path(r"C:\Windows\Fonts\NotoSansSC-VF.ttf"),
-                Path(r"C:\Windows\Fonts\msyh.ttc"),
-                Path(r"C:\Windows\Fonts\simhei.ttf"),
-                Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-                Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
-                Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
-                Path("/System/Library/Fonts/PingFang.ttc"),
-            ]
-        )
-        for path in candidates:
-            if path.is_file():
-                return ImageFont.truetype(str(path), size)
-        return ImageFont.load_default(size=size)
-
-    def _fonts(self) -> dict[str, Any]:
-        return {
-            "hero": self._font(56, True),
-            "title": self._font(38, True),
-            "section": self._font(31, True),
-            "body": self._font(25),
-            "body_bold": self._font(25, True),
-            "small": self._font(21),
-            "small_bold": self._font(21, True),
-            "tiny": self._font(18),
-        }
-
-    def _load_avatar(self, size: int, border: tuple[int, int, int, int]):
-        # Read on every render so replacing logo.png takes effect immediately.
-        try:
-            source = Image.open(self.plugin_dir / "logo.png").convert("RGB")
-        except Exception:
-            return None
-        source = ImageOps.fit(
-            source,
-            (size, size),
-            method=Image.Resampling.LANCZOS,
-            centering=(0.55, 0.45),
-        )
-        mask = Image.new("L", (size, size), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
-        result = Image.new("RGBA", (size + 12, size + 12), (0, 0, 0, 0))
-        ImageDraw.Draw(result).ellipse((0, 0, size + 11, size + 11), fill=border)
-        result.paste(source, (6, 6), mask)
-        return result
-
+    # -- palette -----------------------------------------------------------
     @staticmethod
-    def _rounded(draw, box, radius, fill, outline=None, width=1):
-        draw.rounded_rectangle(
-            box, radius=radius, fill=fill, outline=outline, width=width
-        )
-
-    @staticmethod
-    def _shadow(image, box, radius=24, blur=14, offset=(0, 6)):
-        layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(layer)
-        left, top, right, bottom = box
-        ox, oy = offset
-        draw.rounded_rectangle(
-            (left + ox, top + oy, right + ox, bottom + oy),
-            radius=radius,
-            fill=(30, 40, 60, 26),
-        )
-        image.alpha_composite(layer.filter(ImageFilter.GaussianBlur(blur)))
-
-    @staticmethod
-    def _text_width(draw, text, font):
-        bounds = draw.textbbox((0, 0), text, font=font)
-        return bounds[2] - bounds[0]
-
-    def _wrap(self, draw, text: str, font, max_width: int) -> list[str]:
-        lines = []
-        for paragraph in str(text).splitlines() or [""]:
-            if not paragraph:
-                lines.append("")
-                continue
-            line = ""
-            for char in paragraph:
-                candidate = line + char
-                if line and self._text_width(draw, candidate, font) > max_width:
-                    lines.append(line)
-                    line = char
-                else:
-                    line = candidate
-            if line:
-                lines.append(line)
-        return lines or [""]
-
-    @staticmethod
-    def _draw_lines(draw, x, y, lines, font, fill, step):
-        for line in lines:
-            draw.text((x, y), line, font=font, fill=fill)
-            y += step
-        return y
-
-    @staticmethod
-    def _palette(theme: str) -> dict[str, str]:
+    def _palette(theme: str) -> dict[str, Any]:
         if theme == "night":
             return {
-                "bg": "#17191D",
-                "grid": "#202329",
-                "surface": "#1D2025",
-                "surface_alt": "#22262C",
-                "border": "#343941",
-                "text": "#F1EEE8",
-                "muted": "#9298A3",
-                "blue": "#80D7C5",
-                "coral": "#F06F61",
-                "yellow": "#F4C866",
-                "blue_soft": "#263F3A",
-                "coral_soft": "#442B2B",
+                "stops": [
+                    (0, c("#131228")),
+                    (0.5, c("#1B2140")),
+                    (1, c("#0F1626")),
+                ],
+                "glows": [
+                    ("#6A55C8", 880, 300, 320, 85),
+                    ("#2E8C96", 140, 1400, 300, 50),
+                    ("#8A5A88", 880, 2800, 320, 45),
+                ],
+                "ink": "#ECEAF7",
+                "sub": "#9995B5",
+                "violet": "#9C8CF0",
+                "cyan": "#52B8B4",
+                "teal": "#5FC8B4",
+                "green": "#6FBF95",
+                "orange": "#E0A060",
+                "rose": "#E08BA0",
+                "chip3": "#E08BA0",
+                "tint": (44, 46, 88),
+                "talpha": 135,
+                "line": (255, 255, 255, 48),
+                "panel": (255, 255, 255, 26),
+                "shadow_a": 95,
             }
         return {
-            "bg": "#F5F7FB",
-            "grid": "#E9EDF5",
-            "surface": "#FFFFFF",
-            "surface_alt": "#F8FAFD",
-            "border": "#E0E6F0",
-            "text": "#27324A",
-            "muted": "#69748B",
-            "blue": "#3C98D4",
-            "coral": "#E76E68",
-            "yellow": "#D29A26",
-            "blue_soft": "#E7F4FF",
-            "coral_soft": "#FFEAE8",
+            "stops": [(0, c("#F1E6F8")), (0.5, c("#E2EAFA")), (1, c("#F8E9E6"))],
+            "glows": [
+                ("#B79BEB", 880, 300, 320, 85),
+                ("#8FD0D8", 140, 1400, 300, 55),
+                ("#E8A8B8", 880, 2800, 320, 50),
+            ],
+            "ink": "#33304A",
+            "sub": "#7A7490",
+            "violet": "#7E68DC",
+            "cyan": "#3FA8A8",
+            "teal": "#3E9C8A",
+            "green": "#3E9C6E",
+            "orange": "#C9822F",
+            "rose": "#D97BA0",
+            "chip3": "#D97BA0",
+            "tint": (255, 255, 255),
+            "talpha": 135,
+            "line": (255, 255, 255, 200),
+            "panel": (255, 255, 255, 95),
+            "shadow_a": 42,
         }
 
-    def _measure_fact_rows(self, draw, facts, fonts):
-        rows = []
-        for index in range(0, len(facts), 2):
-            pair = facts[index : index + 2]
-            measured = []
-            for label, value in pair:
-                lines = self._wrap(draw, value, fonts["body_bold"], 340)
-                height = max(112, 55 + len(lines) * 34)
-                measured.append((label, lines, height))
-            rows.append((measured, max(item[2] for item in measured)))
-        return rows
-
-    def _measure_list(self, draw, items, fonts):
-        measured = []
-        for item in items or ("无",):
-            lines = self._wrap(draw, item, fonts["body"], 820)
-            height = max(52, 16 + len(lines) * 34)
-            measured.append((lines, height))
-        return measured
-
-    def _render_image(self, data, now, theme):
-        fonts = self._fonts()
-        colors = self._palette(theme)
-        probe = ImageDraw.Draw(Image.new("RGB", (self.width, 100)))
-        fact_rows = self._measure_fact_rows(probe, data.facts, fonts)
-        daily_rows = self._measure_list(probe, data.daily_items, fonts)
-        pending_rows = self._measure_list(probe, data.pending_items, fonts)
-
-        header_top = 42
-        header_height = 210
-        summary_top = 284
-        summary_height = 226
-        facts_top = summary_top + summary_height + 32
-        facts_height = 76 + sum(row[1] + 14 for row in fact_rows) + 12
-        daily_top = facts_top + facts_height + 30
-        daily_height = 82 + sum(row[1] for row in daily_rows) + 24
-        pending_top = daily_top + daily_height + 30
-        pending_height = 82 + sum(row[1] for row in pending_rows) + 24
-        height = pending_top + pending_height + 82
-
-        image = Image.new("RGBA", (self.width, height), colors["bg"])
-        draw = ImageDraw.Draw(image)
-        for y in range(0, height, 48 if theme == "day" else 64):
-            draw.line((0, y, self.width, y), fill=colors["grid"], width=1)
-        if theme == "day":
-            draw.rectangle((0, 0, 18, height), fill="#FF8E88")
-            draw.rectangle((18, 0, 28, height), fill="#87BDE8")
-            self._rounded(
-                draw,
-                (58, header_top, 1022, header_top + header_height),
-                32,
-                colors["surface"],
-            )
-        else:
-            draw.rectangle((0, 0, self.width, 18), fill=colors["coral"])
-
-        avatar = self._load_avatar(
-            138,
-            (135, 189, 232, 255) if theme == "day" else (240, 111, 97, 255),
-        )
-        if avatar:
-            image.alpha_composite(avatar, (82 if theme == "day" else 844, 72))
-        title_x = 254 if theme == "day" else 58
-        draw.text(
-            (title_x, 72), "主动对话状态", font=fonts["hero"], fill=colors["text"]
-        )
-        draw.text(
-            (title_x + 3, 145),
-            f"{now:%Y.%m.%d  ·  %H:%M}",
-            font=fonts["small"],
-            fill=colors["muted"],
-        )
-        draw.text(
-            (title_x + 3, 188),
-            "LINGXI · PROACTIVE CONVERSATION",
-            font=fonts["tiny"],
-            fill=colors["blue"],
+    # -- helpers -----------------------------------------------------------
+    def _card(self, cv: Canvas, box, pal, radius=26):
+        cv.shadow(box, radius, 20, 12, alpha=pal["shadow_a"])
+        cv.glass(
+            box,
+            radius=radius,
+            tint=pal["tint"],
+            alpha=pal["talpha"],
+            outline=pal["line"],
+            owidth=1.5,
         )
 
-        if theme == "day":
-            self._shadow(image, (58, summary_top, 1022, summary_top + summary_height))
-            draw = ImageDraw.Draw(image)
-        self._rounded(
-            draw,
-            (58, summary_top, 1022, summary_top + summary_height),
-            28 if theme == "day" else 20,
-            colors["surface_alt"],
-            outline=colors["blue"] if theme == "night" else None,
-            width=3 if theme == "night" else 1,
+    def _status_color(self, status: str | None, pal):
+        if status is None:
+            return None
+        kind = _status_kind(status)
+        if kind == "skipped":
+            return pal["sub"]
+        return {
+            "sent": pal["green"],
+            "waiting": pal["orange"],
+            "other": pal["rose"],
+        }.get(kind, pal["sub"])
+
+    def _daily_metrics(
+        self, cv: Canvas, item, item_f, status_f, x, maxw, right, line_h, pad
+    ):
+        """Height of one daily entry; status tag sits inline when it fits."""
+        main, status = _split_status(item)
+        lines = cv.wrap(main, item_f, maxw)
+        h = len(lines) * line_h
+        if status is not None:
+            sw = cv.tlen(status, status_f)
+            if x + cv.tlen(lines[-1], item_f) + 14 + sw > right:
+                h += line_h
+        return lines, status, h + pad
+
+    def _draw_daily_item(
+        self,
+        cv: Canvas,
+        x,
+        y,
+        item,
+        item_f,
+        status_f,
+        maxw,
+        right,
+        line_h,
+        pad,
+        ink,
+        pal,
+    ):
+        lines, status, h = self._daily_metrics(
+            cv, item, item_f, status_f, x, maxw, right, line_h, pad
         )
-        main_color = colors["blue"] if data.subscribed else colors["coral"]
-        draw.ellipse((92, summary_top + 44, 122, summary_top + 74), fill=main_color)
-        draw.text(
-            (148, summary_top + 25),
-            data.subscription,
-            font=fonts["title"],
-            fill=colors["text"],
-        )
-        subtitle = "主动对话正在运行" if data.subscribed else "当前会话不会触发主动对话"
-        draw.text(
-            (94, summary_top + 100),
-            subtitle,
-            font=fonts["body"],
-            fill=colors["muted"],
-        )
+        ly = y
+        for line in lines:
+            cv.text(x, ly, line, item_f, ink)
+            ly += line_h
+        if status is not None:
+            col = self._status_color(status, pal)
+            sw = cv.tlen(status, status_f)
+            if x + cv.tlen(lines[-1], item_f) + 14 + sw <= right:
+                cv.text(
+                    x + cv.tlen(lines[-1], item_f) + 14,
+                    ly - line_h + 3,
+                    status,
+                    status_f,
+                    col,
+                )
+            else:
+                cv.text(x, ly, status, status_f, col)
+        return h
+
+    # -- sections ----------------------------------------------------------
+    def _draw_header(self, cv: Canvas, pal, now: datetime):
+        ink = pal["ink"]
+        self._card(cv, (58, 52, 1022, 236), pal)
+        cv.avatar(self.plugin_dir / "logo.png", 926, 144, 104, pal["line"], 3)
+        cv.spaced(92, 84, "PROACTIVE CONVERSATION", font(17, 500), pal["violet"], 5)
+        cv.text(92, 114, "主动对话状态", font(40, 800), ink)
+        cv.text(92, 178, f"{now:%Y.%m.%d · %H:%M}", font(20, 450), pal["sub"])
+
+    def _draw_subscription(self, cv: Canvas, top, data, pal):
+        ink, sub = pal["ink"], pal["sub"]
+        self._card(cv, (58, top, 1022, top + 216), pal)
+        main_color = pal["teal"] if data.subscribed else pal["rose"]
+        cv.dot(104, top + 56, 8, c(main_color))
+        cv.text(132, top + 34, data.subscription, font(30, 700), ink)
+        note = "主动对话正在运行" if data.subscribed else "当前会话不会触发主动对话"
+        cv.text(100, top + 98, note, font(21, 450), sub)
         chips = (
             ("忙碌联动", "忙碌中" if data.is_busy else "空闲", not data.is_busy),
             ("智能判断", "开启" if data.judge_enabled else "关闭", data.judge_enabled),
-            ("聊天热度", data.heat_label, data.heat_label not in {"冷", "已关闭"}),
+            (
+                "聊天热度",
+                data.heat_label,
+                data.heat_label not in {"冷", "已关闭"},
+            ),
         )
-        chip_x = 94
-        for label, value, active in chips:
-            box = (chip_x, summary_top + 156, chip_x + 260, summary_top + 202)
-            fill = colors["blue_soft"] if active else colors["coral_soft"]
-            self._rounded(draw, box, 12, fill)
-            draw.text(
-                (chip_x + 16, summary_top + 166),
-                f"{label}  {value}",
-                font=fonts["tiny"],
-                fill=colors["blue"] if active else colors["coral"],
-            )
-            chip_x += 284
+        colors = [pal["teal"], pal["violet"], pal["chip3"]]
+        x = 100
+        for i, (label, value, active) in enumerate(chips):
+            f = font(18, 600)
+            text = f"{label}  {value}"
+            w = cv.tlen(text, f) + 32
+            col = colors[i] if active else pal["rose"]
+            cv.rrect((x, top + 140, x + w, top + 178), 19, fill=c(col, 36))
+            cv.text(x + 16, top + 148, text, f, c(col))
+            x += w + 14
 
-        self._rounded(
-            draw,
-            (58, facts_top, 1022, facts_top + facts_height),
-            26 if theme == "day" else 18,
-            colors["surface"],
-            outline=colors["border"],
-        )
-        draw.text(
-            (88, facts_top + 25), "运行概览", font=fonts["section"], fill=colors["text"]
-        )
-        y = facts_top + 76
-        for row, row_height in fact_rows:
-            for column, (label, lines, _height) in enumerate(row):
-                x = 84 + column * 476
-                self._rounded(
-                    draw,
-                    (x, y, x + 448, y + row_height),
-                    15,
-                    colors["surface_alt"],
-                    outline=colors["border"],
-                )
-                draw.text(
-                    (x + 20, y + 16), label, font=fonts["tiny"], fill=colors["muted"]
-                )
-                self._draw_lines(
-                    draw,
-                    x + 20,
-                    y + 49,
-                    lines,
-                    fonts["body_bold"],
-                    colors["text"],
-                    34,
-                )
-            y += row_height + 14
+    def _draw_overview(self, cv: Canvas, top, data, pal):
+        ink, sub = pal["ink"], pal["sub"]
+        rows = []
+        probe = Canvas(height=8)
+        value_f = font(23, 600)
+        for label, value in data.facts:
+            lines = probe.wrap(value, value_f, 660)
+            rows.append((label, lines, 14 + len(lines) * 35 + 18))
+        h = 66 + sum(r[2] for r in rows) + 14
+        self._card(cv, (58, top, 1022, top + h), pal)
+        cv.text(92, top + 24, "运行概览", font(26, 700), ink)
+        cv.spaced(988, top + 32, "OVERVIEW", font(16, 500), sub, 4, anchor="ra")
+        y = top + 66
+        label_f = font(20, 450)
+        for i, (label, lines, rh) in enumerate(rows):
+            cv.text(92, y + 6, label, label_f, sub)
+            ly = y
+            for line in lines:
+                cv.text(320, ly, line, value_f, ink)
+                ly += 35
+            y += rh
+            if i < len(rows) - 1:
+                cv.hline(92, 988, y - 10, c(ink, 30), 1)
+        return h
 
-        self._draw_list_section(
-            draw,
-            daily_top,
-            daily_height,
-            "相关每日问候",
-            daily_rows,
-            colors["yellow"],
-            colors,
-            fonts,
-            theme,
+    def _draw_daily(self, cv: Canvas, top, data, pal):
+        ink, _sub = pal["ink"], pal["sub"]
+        items = data.daily_items or ("暂无相关问候记录",)
+        item_f, status_f = font(24, 450), font(19, 600)
+        probe = Canvas(height=8)
+        daily_hs = [
+            self._daily_metrics(probe, it, item_f, status_f, 126, 800, 988, 36, 34)[2]
+            for it in items
+        ]
+        h = 76 + sum(daily_hs) + 20
+        self._card(cv, (58, top, 1022, top + h), pal)
+        cv.text(92, top + 24, "相关每日问候", font(26, 700), ink)
+        cv.spaced(
+            988,
+            top + 32,
+            "DAILY GREETINGS",
+            font(16, 500),
+            pal["violet"],
+            4,
+            anchor="ra",
         )
-        self._draw_list_section(
-            draw,
-            pending_top,
-            pending_height,
-            "待触发任务",
-            pending_rows,
-            colors["blue"],
-            colors,
-            fonts,
-            theme,
-        )
-        draw.text(
-            (58, height - 48),
-            "LINGXI  ·  PROACTIVE STATUS",
-            font=fonts["tiny"],
-            fill=colors["muted"],
-        )
-        return image.convert("RGB")
-
-    def _draw_list_section(
-        self, draw, top, height, title, rows, accent, colors, fonts, theme
-    ):
-        self._rounded(
-            draw,
-            (58, top, 1022, top + height),
-            26 if theme == "day" else 18,
-            colors["surface"],
-            outline=colors["border"],
-        )
-        draw.text((88, top + 24), title, font=fonts["section"], fill=colors["text"])
         y = top + 76
-        for lines, row_height in rows:
-            draw.ellipse((94, y + 12, 106, y + 24), fill=accent)
-            self._draw_lines(
-                draw,
-                126,
-                y + 3,
-                lines,
-                fonts["body"],
-                colors["text"],
-                34,
+        for i, item in enumerate(items):
+            cv.dot(102, y + 16, 5, c(pal["violet"], 220))
+            ih = self._draw_daily_item(
+                cv, 126, y, item, item_f, status_f, 800, 988, 36, 34, ink, pal
             )
-            y += row_height
+            y += ih
+            if i < len(items) - 1:
+                cv.hline(126, 988, y - 22, c(ink, 22), 1)
+        return h
+
+    def _draw_pending(self, cv: Canvas, top, data, pal):
+        ink, _sub = pal["ink"], pal["sub"]
+        items = data.pending_items or ("暂无待触发任务",)
+        n = len(items)
+        h = 76 + (n - 1) * 56 + 48
+        self._card(cv, (58, top, 1022, top + h), pal)
+        cv.text(92, top + 24, "待触发任务", font(26, 700), ink)
+        cv.spaced(
+            988,
+            top + 32,
+            "PENDING TASKS",
+            font(16, 500),
+            pal["cyan"],
+            4,
+            anchor="ra",
+        )
+        y = top + 76
+        name_f, time_f = font(24, 600), font(19, 600)
+        for i, item in enumerate(items):
+            name, _, time_text = item.partition(" → ")
+            cv.dot(102, y + 16, 5, c(pal["cyan"], 220))
+            cv.text(126, y, name, name_f, ink)
+            if time_text:
+                cv.text(
+                    988, y + 4, "→ " + time_text, time_f, c(pal["cyan"]), anchor="ra"
+                )
+            y += 56
+            if i < n - 1:
+                cv.hline(126, 988, y - 15, c(ink, 22), 1)
+        return h
+
+    # -- entry ---------------------------------------------------------------
+    def _render_image(
+        self, data: ProactiveStatusImageData, now: datetime, theme: str
+    ) -> bytes:
+        pal = self._palette(theme)
+        _ink, sub = pal["ink"], pal["sub"]
+
+        # measure pass fixes the canvas height before any drawing
+        probe = Canvas(height=8)
+        value_f = font(23, 600)
+        ov_rows = []
+        for label, value in data.facts:
+            lines = probe.wrap(value, value_f, 660)
+            ov_rows.append(14 + len(lines) * 35 + 18)
+        daily_items = data.daily_items or ("暂无相关问候记录",)
+        item_f, status_f = font(24, 450), font(19, 600)
+        daily_hs = [
+            self._daily_metrics(probe, it, item_f, status_f, 126, 800, 988, 36, 34)[2]
+            for it in daily_items
+        ]
+        sub_top = 264
+        ov_h = 66 + sum(ov_rows) + 14
+        ov_top = sub_top + 216 + 28
+        daily_h = 76 + sum(daily_hs) + 20
+        daily_top = ov_top + ov_h + 28
+        pend_items = data.pending_items or ("暂无待触发任务",)
+        pend_h = 76 + (len(pend_items) - 1) * 56 + 48
+        pend_top = daily_top + daily_h + 28
+        yf = pend_top + pend_h + 40
+
+        cv = Canvas(
+            height=int(yf + 52) + 40, bg="#F1E6F8" if theme == "day" else "#131228"
+        )
+        cv.bg_gradient(pal["stops"])
+        for col, gx, gy, gr, ga in pal["glows"]:
+            cv.glow(gx, gy, gr, c(col), ga)
+
+        self._draw_header(cv, pal, now)
+        self._draw_subscription(cv, sub_top, data, pal)
+        self._draw_overview(cv, ov_top, data, pal)
+        self._draw_daily(cv, daily_top, data, pal)
+        self._draw_pending(cv, pend_top, data, pal)
+
+        cv.spaced(
+            540, yf, "LINGXI · PROACTIVE STATUS", font(17, 500), sub, 5, anchor="ma"
+        )
+        return cv.finish(int(yf + 52))
