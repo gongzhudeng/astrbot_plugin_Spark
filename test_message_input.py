@@ -139,6 +139,20 @@ def test_prompt_diagnostics_exposes_only_markers_and_counts():
     assert "private memory" not in str(diagnostics)
 
 
+def test_background_completion_placeholder_supports_neutral_text():
+    plugin = Spark.__new__(Spark)
+    plugin.cfg = {"proactive_settings": {}}
+
+    legacy = "【会话占位：用户未发送新消息；助手在图片任务完成后补充通知】"
+    neutral = "【会话占位：用户未发送新消息；助手在后台任务完成后补充通知】"
+
+    assert plugin._is_proactive_placeholder(legacy)
+    assert plugin._is_proactive_placeholder(neutral)
+    assert not plugin._is_proactive_placeholder(
+        "用户未发送新消息；助手在后台任务完成后补充通知"
+    )
+
+
 def test_image_completion_placeholder_is_proactive_round_not_user_message():
     placeholder = "【会话占位：用户未发送新消息；助手在图片任务完成后补充通知】"
     plugin = Spark.__new__(Spark)
