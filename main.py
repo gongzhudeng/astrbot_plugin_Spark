@@ -5334,12 +5334,13 @@ class Spark(Star):
             if not segments:
                 return [text]
 
-            # 清理并过滤空段落
+            # 清理并过滤空段落（与 AstrBot 分段逻辑保持一致：清理后需 strip 再发送）
             result = []
             for seg in segments:
                 if cleanup_rule:
                     seg = re.sub(cleanup_rule, "", seg)
-                if seg.strip():
+                seg = seg.strip()
+                if seg:
                     result.append(seg)
 
             return result if result else [text]
