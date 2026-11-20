@@ -4847,6 +4847,20 @@ class Spark(Star):
 
         req = ProviderRequest()
         req.prompt = prompt
+        # v2.8.3：主动消息也要带内心世界，位置与正常对话**完全一致**
+        # （临时用户上下文末尾，走 extra_user_content_parts + mark_as_temp）。
+        # 原来只有 _judge_should_reply 读过它：判断「要不要开口」时知道心情，
+        # 真正「开口说什么」时却不知道，于是主动消息永远是标准调子。
+        try:
+            emotion_context = await self._get_emotion_judge_context(umo)
+            if emotion_context:
+                from astrbot.core.agent.message import TextPart
+
+                req.extra_user_content_parts.append(
+                    TextPart(text=emotion_context).mark_as_temp()
+                )
+        except Exception as exc:
+            logger.warning(f"[Spark] 主动消息注入内心世界失败({umo}): {exc}")
         hook_history_len = None
         curr_cid = None
 
