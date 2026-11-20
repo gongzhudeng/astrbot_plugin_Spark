@@ -595,7 +595,7 @@
       "prompt_template": {
         "description": "提醒文案模板",
         "type": "text",
-        "default": "提醒内容：{reminder_content}",
+        "default": "[到点提醒] 该提醒Mando了：{reminder_content}",
         "hint": "{reminder_content} 会替换成事项内容，其余可自由改写"
       }
     }
