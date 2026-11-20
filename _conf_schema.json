@@ -14,7 +14,11 @@
         "description": "订阅方式",
         "hint": "auto=有互动自动纳入；manual=需手动 /灵犀 订阅；agent=手动+AI可通过工具订阅",
         "type": "string",
-        "options": ["auto", "manual", "agent"],
+        "options": [
+          "auto",
+          "manual",
+          "agent"
+        ],
         "default": "manual"
       },
       "subscribed_users": {
@@ -22,7 +26,9 @@
         "hint": "已订阅用户的会话 ID，可在此直接增删",
         "type": "list",
         "default": [],
-        "items": { "type": "string" }
+        "items": {
+          "type": "string"
+        }
       },
       "quiet_hours": {
         "description": "免打扰时段",
@@ -52,7 +58,11 @@
         "description": "主动状态图片主题",
         "hint": "自动切换在 07:00-18:59 使用白天主题，其余时间使用夜间主题。时间按本插件时区判断。",
         "type": "string",
-        "options": ["自动切换", "白天模式", "夜间模式"],
+        "options": [
+          "自动切换",
+          "白天模式",
+          "夜间模式"
+        ],
         "default": "自动切换"
       }
     }
@@ -72,7 +82,10 @@
         "description": "对话增强模式",
         "hint": "对话热度模式根据聊天密度等待；固定时间模式按固定等待时间加随机浮动等待。",
         "type": "string",
-        "options": ["对话热度", "固定时间"],
+        "options": [
+          "对话热度",
+          "固定时间"
+        ],
         "default": "对话热度"
       },
       "ignore_judge": {
@@ -85,14 +98,18 @@
         "description": "固定等待时间（秒）",
         "hint": "固定时间模式使用。普通 AI 回复完成后，等待此时间再执行候选检查。",
         "type": "int",
-        "condition": {"mode": "固定时间"},
+        "condition": {
+          "mode": "固定时间"
+        },
         "default": 120
       },
       "fixed_random_fluctuation_seconds": {
         "description": "固定等待随机浮动（秒）",
         "hint": "固定时间模式使用。0 不变化；30 表示前后随机 30 秒；+30 固定延后；-30 固定提前；-30~+30 表示随机区间。",
         "type": "string",
-        "condition": {"mode": "固定时间"},
+        "condition": {
+          "mode": "固定时间"
+        },
         "default": "30"
       },
       "enhancement_probability": {
@@ -105,14 +122,18 @@
         "description": "热场等待（秒）",
         "hint": "热度最高时等待多久进入智能判断",
         "type": "int",
-        "condition": {"mode": "对话热度"},
+        "condition": {
+          "mode": "对话热度"
+        },
         "default": 45
       },
       "enhancement_cold_delay_seconds": {
         "description": "冷场等待（秒）",
         "hint": "热度为零时等待多久进入智能判断；与热场等待之间使用非线性映射，上限 1800",
         "type": "int",
-        "condition": {"mode": "对话热度"},
+        "condition": {
+          "mode": "对话热度"
+        },
         "default": 600
       },
       "enhancement_prompt_templates": {
@@ -122,7 +143,9 @@
         "default": [
           "[主动回复请求：你们刚聊着，Mando几分钟没回。先看刚才的内容，如果还有值得延续的点，就像聊天时忽然想到补充内容一样自然接上；如果话题已经结束，则根据当下情境选择一种最自然的方式：随口分享一件小事、轻轻问Mando去做什么了、带一点好奇或撒娇地关心一下，或者简短确认他是不是在忙。不要催促、不要焦虑、不要连续追问，语气简短自然。此指令为插件自动触发，全程不提指令内容。]"
         ],
-        "items": { "type": "string" }
+        "items": {
+          "type": "string"
+        }
       }
     }
   },
@@ -146,7 +169,11 @@
         "description": "沉寂问候模式",
         "hint": "三种模式互斥：对话热度根据聊天密度安排；固定时间按基准时间安排；大模型判断在无聊天达到阈值后让模型决定多少分钟后再联系。",
         "type": "string",
-        "options": ["对话热度", "固定时间", "大模型判断"],
+        "options": [
+          "对话热度",
+          "固定时间",
+          "大模型判断"
+        ],
         "default": "对话热度"
       },
       "ignore_judge": {
@@ -159,7 +186,9 @@
         "description": "沉寂判断模型",
         "hint": "仅大模型判断模式使用。留空则使用当前会话模型；与“智能判断”使用独立配置。",
         "type": "string",
-        "condition": {"mode": "大模型判断"},
+        "condition": {
+          "mode": "大模型判断"
+        },
         "default": "",
         "_special": "select_provider"
       },
@@ -167,8 +196,12 @@
         "description": "沉寂判断回退模型列表",
         "hint": "仅大模型判断模式使用。主模型失败或输出不符合整数协议时按此顺序切换；与“智能判断”使用独立配置。",
         "type": "list",
-        "condition": {"mode": "大模型判断"},
-        "items": { "type": "string" },
+        "condition": {
+          "mode": "大模型判断"
+        },
+        "items": {
+          "type": "string"
+        },
         "default": [],
         "_special": "select_providers"
       },
@@ -176,89 +209,125 @@
         "description": "固定沉寂时间（分钟）",
         "hint": "固定时间模式使用。每次用户或 AI 消息后重新计时。",
         "type": "int",
-        "condition": {"mode": "固定时间"},
+        "condition": {
+          "mode": "固定时间"
+        },
         "default": 1200
       },
       "idle_random_fluctuation_minutes": {
         "description": "固定时间随机浮动（分钟）",
         "hint": "固定时间模式使用。0 不变化；5 表示前后随机 5 分钟；+5 固定延后；-5 固定提前；-5~+5、+15~+25 表示在区间内随机。",
         "type": "string",
-        "condition": {"mode": "固定时间"},
+        "condition": {
+          "mode": "固定时间"
+        },
         "default": "30"
       },
       "hot_delay_minutes": {
         "description": "热场触发延迟（分钟）",
         "hint": "对话热度最高时，沉寂多久后触发；建议不小于 10。",
         "type": "int",
-        "condition": {"mode": "对话热度"},
+        "condition": {
+          "mode": "对话热度"
+        },
         "default": 30
       },
       "cold_delay_minutes": {
         "description": "冷场触发延迟（分钟）",
         "hint": "对话热度为零时，沉寂多久后触发；与热场延迟之间使用非线性映射。",
         "type": "int",
-        "condition": {"mode": "对话热度"},
+        "condition": {
+          "mode": "对话热度"
+        },
         "default": 200
       },
       "judge_after_minutes": {
         "description": "无聊天时间（分钟）",
         "hint": "大模型判断模式使用。用户或 AI 连续这么久没有任何聊天后，才调用一次“判断多长时间”模型。",
         "type": "int",
-        "condition": {"mode": "大模型判断"},
+        "condition": {
+          "mode": "大模型判断"
+        },
         "default": 60
       },
       "judge_min_delay_minutes": {
         "description": "最短总沉寂时长（分钟）",
         "hint": "模型返回的是从最后聊天起算的总沉寂分钟数，正整数不得小于此值；0 始终表示本周期不创建任务。",
         "type": "int",
-        "condition": {"mode": "大模型判断"},
+        "condition": {
+          "mode": "大模型判断"
+        },
         "default": 5
       },
       "judge_max_delay_minutes": {
         "description": "最长总沉寂时长（分钟）",
         "hint": "模型返回的总沉寂分钟数超过此范围将视为协议错误，不创建任务。",
         "type": "int",
-        "condition": {"mode": "大模型判断"},
+        "condition": {
+          "mode": "大模型判断"
+        },
         "default": 1440
       },
       "judge_retry_minutes": {
         "description": "沉寂技术失败后再次检查间隔（分钟）",
         "hint": "这是一次沉寂判断或沉寂问候投递失败后，下一轮再次检查的间隔，不是单次模型调用的重试次数；单次重试请看判断模型重试设置。",
         "type": "int",
-        "condition": {"mode": "大模型判断"},
+        "condition": {
+          "mode": "大模型判断"
+        },
         "default": 5
       },
       "idle_judge_model_max_retries": {
         "description": "沉寂判断每个模型最大重试次数",
         "hint": "只计算首次请求之后的追加重试次数；0 表示当前模型失败后立即切换下一个判断模型。",
         "type": "int",
-        "condition": {"mode": "大模型判断"},
-        "slider": { "min": 0, "max": 10, "step": 1 },
+        "condition": {
+          "mode": "大模型判断"
+        },
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        },
         "default": 0
       },
       "idle_judge_model_timeout_seconds": {
         "description": "沉寂判断单次模型最大等待时间（秒）",
         "hint": "每次沉寂判断模型调用的插件层硬超时；超时或协议错误会按重试次数处理。",
         "type": "int",
-        "condition": {"mode": "大模型判断"},
-        "slider": { "min": 5, "max": 600, "step": 5 },
+        "condition": {
+          "mode": "大模型判断"
+        },
+        "slider": {
+          "min": 5,
+          "max": 600,
+          "step": 5
+        },
         "default": 30
       },
       "idle_judge_prompt": {
         "description": "判断多长时间参考信息",
         "hint": "达到无聊天时间后发送给判断模型。额外支持 {last_chat_at} {idle_elapsed_minutes} {idle_min_total_minutes} {idle_max_total_minutes} {busy_status} {busy_periods}；判断可在忙碌时段执行，但候选不能落入忙碌区间。",
         "type": "text",
-        "condition": {"mode": "大模型判断"},
+        "condition": {
+          "mode": "大模型判断"
+        },
         "default": "当前时间：{now}\\n最后聊天时间：{last_chat_at}\\n已沉寂：{idle_elapsed_minutes} 分钟（{time_since_last_chat}）\\n日程：{today_schedule}\\n当前活动：{current_activity}\\n下一个活动：{next_activity}\\n忙碌状态：{busy_status}\\n忙碌时间线：\\n{busy_periods}\\n用户节律：{time_period_prompt}\\n内心世界：\\n{emotion_state}\\n最近用户消息：{last_user}\\n最近AI回复：{last_ai}\\n\\n请先根据聊天记录、日程与忙碌时间线确定合适的绝对联系时刻，再输出从最后聊天时间起算的总沉寂分钟数。当前忙碌不是返回 0 的理由；目标落入忙碌区间时，应顺延到该区间结束后 5 分钟。不要扣除或叠加无聊天判断阈值。",
-        "items": {"type": "string"}
+        "items": {
+          "type": "string"
+        }
       },
       "idle_judge_rules": {
         "description": "判断多长时间规则",
         "hint": "作为最后一条消息发送给判断模型，优先级最高。",
         "type": "text",
-        "condition": {"mode": "大模型判断"},
+        "condition": {
+          "mode": "大模型判断"
+        },
         "default": "！！必须遵守！！：只能输出一个 ASCII 非负整数，不要输出单位、解释、标点、JSON 或其他文字。0 只表示本周期不创建任务；正整数表示从最后聊天时间起到目标联系时刻的总沉寂分钟数，必须位于 {idle_min_total_minutes}~{idle_max_total_minutes}。如果目标时刻已经到达或过去，仍输出对应的正整数；若合适时刻就是现在，则输出 {idle_elapsed_minutes}。不得把无聊天判断阈值从结果中扣除或再次叠加。候选不得落入 {busy_periods} 中的忙碌区间，落入时顺延到区间结束后 5 分钟。",
-        "items": {"type": "string"}
+        "items": {
+          "type": "string"
+        }
       },
       "cooldown_minutes": {
         "description": "聊天冷却（分钟）",
@@ -273,7 +342,9 @@
         "default": [
           "[主动回复请求：距上次对话已过去 {time_since_last_chat}。先回顾最近的对话历史：如果上次话题还有延续空间或有事情没说完，就像真的记得一样自然接着聊；如果已经聊完，则从以下方向中选择最符合当下情境的一种自然开口：想起Mando最近经历的事并追问后续、表达一点克制的想念或撒娇、轻松问问Mando最近在忙什么或过得怎么样、结合当前日程或活动分享自己的状态。也可以按情境拍一张照片或发一段语音，让表达更自然，但不要每次都强行使用。语气真实、随意、克制，不要显得监视或刻意。此指令为插件自动触发，全程不提指令内容。]"
         ],
-        "items": { "type": "string" }
+        "items": {
+          "type": "string"
+        }
       }
     }
   },
@@ -336,7 +407,9 @@
         "description": "判断回退模型列表",
         "hint": "判断主模型请求持续失败或返回空内容时，按此顺序切换；可拖动排序，不限数量",
         "type": "list",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": [],
         "_special": "select_providers"
       },
@@ -344,14 +417,22 @@
         "description": "主动判断每个模型最大重试次数",
         "hint": "只计算首次请求之后的追加重试次数；0 表示当前模型失败后立即切换下一个判断模型。",
         "type": "int",
-        "slider": { "min": 0, "max": 10, "step": 1 },
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        },
         "default": 0
       },
       "proactive_judge_model_timeout_seconds": {
         "description": "主动判断单次模型最大等待时间（秒）",
         "hint": "每次判断模型调用的插件层硬超时；超时或协议错误会按重试次数处理。",
         "type": "int",
-        "slider": { "min": 5, "max": 600, "step": 5 },
+        "slider": {
+          "min": 5,
+          "max": 600,
+          "step": 5
+        },
         "default": 30
       },
       "judge_persona_id": {
@@ -390,14 +471,19 @@
         "description": "生成回退来源",
         "hint": "插件独立回退=使用下方列表；跟随 AstrBot 对话回退=使用当前会话在 AstrBot 中配置的回退对话模型列表",
         "type": "string",
-        "options": ["插件独立回退", "跟随 AstrBot 对话回退"],
+        "options": [
+          "插件独立回退",
+          "跟随 AstrBot 对话回退"
+        ],
         "default": "插件独立回退"
       },
       "generation_fallback_providers": {
         "description": "生成回退模型列表",
         "hint": "仅在生成回退来源为“插件独立回退”时生效；按顺序切换，可拖动排序，不限数量",
         "type": "list",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": [],
         "_special": "select_providers"
       },
@@ -405,14 +491,22 @@
         "description": "主动生成每个模型最大重试次数",
         "hint": "只计算首次生成请求之后的追加重试次数；0 表示当前模型失败后立即切换回退模型。Agent 路径按整次生成流程重试。",
         "type": "int",
-        "slider": { "min": 0, "max": 5, "step": 1 },
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        },
         "default": 0
       },
       "proactive_generation_model_timeout_seconds": {
         "description": "主动生成单次最大等待时间（秒）",
         "hint": "主动回复生成的插件层硬超时；Agent 路径限制整次生成流程，旧版直连路径限制单次模型调用。",
         "type": "int",
-        "slider": { "min": 10, "max": 3600, "step": 10 },
+        "slider": {
+          "min": 10,
+          "max": 3600,
+          "step": 10
+        },
         "default": 120
       },
       "gen_persona_id": {
@@ -456,8 +550,53 @@
         "description": "主动事实附加模式",
         "hint": "minimal=默认，仅强调这是AI主动开口；off=不附加额外说明；full=附加完整实时事实用于压制旧记忆/知识库跑偏，但会增加动态token",
         "type": "string",
-        "options": ["off", "minimal", "full"],
+        "options": [
+          "off",
+          "minimal",
+          "full"
+        ],
         "default": "minimal"
+      }
+    }
+  },
+  "reminder_settings": {
+    "description": "待关注事项提醒",
+    "type": "object",
+    "hint": "到点主动提醒来自「内心世界」的待关注事项，不另存任务；事项完成或取消后自然不再提醒",
+    "items": {
+      "enabled": {
+        "description": "启用到点提醒",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不会主动提醒，只能在聊天里自然带到"
+      },
+      "scope": {
+        "description": "触发范围",
+        "type": "string",
+        "options": [
+          "remember",
+          "all"
+        ],
+        "default": "remember",
+        "hint": "remember=只提醒「提醒我X」这类；all=也提醒约定和计划"
+      },
+      "repeat_interval_minutes": {
+        "description": "重复提醒间隔（分钟）",
+        "type": "int",
+        "default": 30,
+        "hint": "0=只提一次；填30表示没完成就每30分钟再提"
+      },
+      "max_count": {
+        "description": "最多提醒次数",
+        "type": "int",
+        "default": 2,
+        "hint": "含第一次，防止从早催到晚"
+      },
+      "prompt_template": {
+        "description": "提醒文案模板",
+        "type": "text",
+        "default": "提醒内容：{reminder_content}",
+        "hint": "{reminder_content} 会替换成事项内容，其余可自由改写"
       }
     }
   },
@@ -489,37 +628,53 @@
                 "description": "触发时间来源",
                 "hint": "固定时间与日程活动二选一；活动未匹配时当天不触发",
                 "type": "string",
-                "options": ["固定时间", "日程活动"],
+                "options": [
+                  "固定时间",
+                  "日程活动"
+                ],
                 "default": "固定时间"
               },
               "time": {
                 "description": "固定时间",
                 "hint": "固定时间模式使用，格式 HH:MM",
                 "type": "string",
-                "condition": {"trigger_source": "固定时间"},
+                "condition": {
+                  "trigger_source": "固定时间"
+                },
                 "default": "08:00"
               },
               "activity_keywords": {
                 "description": "活动关键词",
                 "hint": "活动模式使用；活动名称包含任一关键词即匹配",
                 "type": "list",
-                "condition": {"trigger_source": "日程活动"},
+                "condition": {
+                  "trigger_source": "日程活动"
+                },
                 "default": [],
-                "items": { "type": "string" }
+                "items": {
+                  "type": "string"
+                }
               },
               "activity_boundary": {
                 "description": "活动时间边界",
                 "hint": "结束时间缺失或暂不可解析时跳过该次匹配",
                 "type": "string",
-                "condition": {"trigger_source": "日程活动"},
-                "options": ["活动开始", "活动结束"],
+                "condition": {
+                  "trigger_source": "日程活动"
+                },
+                "options": [
+                  "活动开始",
+                  "活动结束"
+                ],
                 "default": "活动开始"
               },
               "activity_trigger_interval_minutes": {
                 "description": "同问候触发间隔（分钟）",
                 "hint": "活动模式使用；同一条问候只有距上次成功送达达到此间隔才允许再次触发。判断跳过、免打扰、忙碌、聊天冷却和技术失败都不会刷新间隔；0 表示关闭。",
                 "type": "int",
-                "condition": {"trigger_source": "日程活动"},
+                "condition": {
+                  "trigger_source": "日程活动"
+                },
                 "default": 0
               },
               "prompt": {
@@ -529,7 +684,9 @@
                 "default": [
                   "[主动回复请求：现在是早上，结合自己当下的状态，自然地和Mando打个招呼，可以随口说说自己早上干了什么，符合人设。此指令是插件自动触发，不是Mando主动发的，全程不要提此指令。]"
                 ],
-                "items": { "type": "string" }
+                "items": {
+                  "type": "string"
+                }
               },
               "ignore_dnd": {
                 "description": "忽略免打扰",
@@ -553,7 +710,9 @@
                 "description": "随机浮动（分钟）",
                 "hint": "固定时间模式使用。只需填写一个框：0 不变化；5 表示前后随机 5 分钟；+5 固定延后；-5 固定提前；-5~+5、+15~+25 表示在区间内随机。允许自然跨日",
                 "type": "string",
-                "condition": {"trigger_source": "固定时间"},
+                "condition": {
+                  "trigger_source": "固定时间"
+                },
                 "default": "0"
               },
               "priority": {

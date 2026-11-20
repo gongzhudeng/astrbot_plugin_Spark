@@ -2623,6 +2623,10 @@ class Spark(Star):
                 # DND stays fully silent. Busy periods may run the timing judge, but
                 # the idle state machine still blocks delivery until the period ends.
                 if not is_in_dnd:
+                    # v2.9.0：到点提醒优先于闲聊——它有明确时间点，晚了就没意义；
+                    # 发出去就跳过本轮其余主动消息，避免同一时刻两条一起冒出来。
+                    if await self._check_attention_reminder(umo, now, tz):
+                        continue
                     await self._check_idle_greeting(
                         umo,
                         st,
@@ -2992,6 +2996,76 @@ class Spark(Star):
         st.idle_schedule_mode = self._idle_mode()
         delay_m = self._calc_fluctuated_idle_delay(st, anchor_ts, profile)
         st.next_idle_ts = anchor_ts + delay_m * 60 if delay_m else 0.0
+
+    async def _check_attention_reminder(
+        self,
+        umo: str,
+        now: datetime,
+        tz: str | None,
+    ) -> bool:
+        """待关注事项到点提醒。命中并发出返回 True，本轮不再发别的主动消息。
+
+        v2.9.0：提醒来自「内心世界」的待关注事项，不是另有存一份任务——
+        每次现查，所以事项完成/取消后自然不会再提醒，不需要同步删除。
+        先标记再发：两个 tick 同时命中同一条也只会有一次。
+        """
+        if not self._get_cfg("reminder_settings", "enabled", False):
+            return False
+        getter = getattr(self.context, "_emotion_state_due_reminders", None)
+        if not callable(getter):
+            return False
+
+        scope = str(
+            self._get_cfg("reminder_settings", "scope", "remember") or "remember"
+        ).strip()
+        kinds = (
+            ("remember", "commitment", "plan", "follow_up")
+            if scope == "all"
+            else ("remember",)
+        )
+        max_count = int(self._get_cfg("reminder_settings", "max_count", 2) or 2)
+        interval = float(
+            self._get_cfg("reminder_settings", "repeat_interval_minutes", 30) or 0
+        )
+        try:
+            rows = getter(umo, kinds, max_count, interval)
+            rows = await rows if asyncio.iscoroutine(rows) else rows
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Spark] 查询待提醒事项失败({umo}): {exc}")
+            return False
+        if not rows:
+            return False
+
+        target = rows[0] if isinstance(rows[0], dict) else {}
+        item_id = str(target.get("id") or "")
+        content = str(target.get("content") or "").strip()
+        if not content:
+            return False
+
+        marker = getattr(self.context, "_emotion_state_mark_reminded", None)
+        if item_id and callable(marker):
+            try:
+                marked = marker(umo, item_id)
+                await marked if asyncio.iscoroutine(marked) else marked
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[Spark] 标记已提醒失败({umo}): {exc}")
+
+        template = str(
+            self._get_cfg("reminder_settings", "prompt_template", "") or ""
+        ).strip() or "提醒内容：{reminder_content}"
+        prompt = template.replace("{reminder_content}", content)
+
+        logger.info(f"[Spark] 执行待关注事项提醒: {umo} | {content[:40]}")
+        ok = await self._proactive_reply(
+            umo,
+            tz,
+            prompt,
+            skip_judge=True,
+            source="attention_reminder",
+        )
+        if ok:
+            logger.info(f"[Spark] 待关注事项提醒已送达: {umo}")
+        return bool(ok)
 
     async def _check_idle_greeting(
         self,
